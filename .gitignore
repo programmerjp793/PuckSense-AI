@@ -1,0 +1,19 @@
+# Unity folders to ignore
+[Ll]ibrary/
+[Tt]emp/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Bb]uild/
+[Bb]uilds/
+
+# Visual Studio / VS Code
+.vscode/
+.vs/
+*.csproj
+*.sln
+*.user
+*.userprefs
+
+# OS files
+.DS_Store
+Thumbs.db
