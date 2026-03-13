@@ -1,0 +1,23 @@
+# ninja log v5
+38	18429	7871702051313584	GameActivity/CMakeFiles/game.dir/UGAApplication.cpp.o	4cfacb72f1203f94
+126	1784	7871701884661389	FramePacing/CMakeFiles/swappywrapper.dir/UnitySwappyWrapper.cpp.o	e5ee76d1855b3afc
+105	18045	7871702047537486	GameActivity/CMakeFiles/game.dir/UGASoftKeyboard.cpp.o	bb3fcd81859ea067
+22	17924	7871702046249215	GameActivity/CMakeFiles/game.dir/UGAConfiguration.cpp.o	cde6f6e539024a22
+1790	2717	7871701893754465	C:/Users/AQUINO_PC/Puck Sense AI/Library/Bee/Android/Prj/IL2CPP/Gradle/unityLibrary/build/intermediates/cxx/RelWithDebInfo/1y1m2229/obj/arm64-v8a/libswappywrapper.so	5e59ba5336f9797e
+59	17862	7871702045615478	GameActivity/CMakeFiles/game.dir/UGAInputKeyEvent.cpp.o	be6cb23958468de6
+70	17917	7871702045901619	GameActivity/CMakeFiles/game.dir/UGAEntry.cpp.o	ec7d7e44bda96cf8
+2	17998	7871702047067502	GameActivity/CMakeFiles/game.dir/UGADebug.cpp.o	11746c6f03739521
+89	17945	7871702046487160	GameActivity/CMakeFiles/game.dir/UGAInputMotionEvent.cpp.o	f277a30f0a276d48
+49	18305	7871702050151500	GameActivity/CMakeFiles/game.dir/UGAInput.cpp.o	d0e252a0cbc7f17
+18429	18750	7871702054658059	C:/Users/AQUINO_PC/Puck Sense AI/Library/Bee/Android/Prj/IL2CPP/Gradle/unityLibrary/build/intermediates/cxx/RelWithDebInfo/1y1m2229/obj/arm64-v8a/libgame.so	7029b9da305fad3a
+539	4009	7945606185597764	FramePacing/CMakeFiles/swappywrapper.dir/UnitySwappyWrapper.cpp.o	e5ee76d1855b3afc
+4011	6471	7945606209048514	C:/Users/AQUINO_PC/Puck Sense AI/Library/Bee/Android/Prj/IL2CPP/Gradle/unityLibrary/build/intermediates/cxx/RelWithDebInfo/1y1m2229/obj/arm64-v8a/libswappywrapper.so	5e59ba5336f9797e
+398	13654	7945606282302246	GameActivity/CMakeFiles/game.dir/UGAInputKeyEvent.cpp.o	be6cb23958468de6
+207	13796	7945606282312528	GameActivity/CMakeFiles/game.dir/UGAEntry.cpp.o	ec7d7e44bda96cf8
+235	14159	7945606286433413	GameActivity/CMakeFiles/game.dir/UGAConfiguration.cpp.o	cde6f6e539024a22
+452	14259	7945606286559825	GameActivity/CMakeFiles/game.dir/UGAInputMotionEvent.cpp.o	f277a30f0a276d48
+265	15058	7945606295488784	GameActivity/CMakeFiles/game.dir/UGADebug.cpp.o	11746c6f03739521
+510	17727	7945606323429435	GameActivity/CMakeFiles/game.dir/UGASoftKeyboard.cpp.o	bb3fcd81859ea067
+425	17733	7945606323439623	GameActivity/CMakeFiles/game.dir/UGAInput.cpp.o	d0e252a0cbc7f17
+132	17763	7945606323454114	GameActivity/CMakeFiles/game.dir/UGAApplication.cpp.o	4cfacb72f1203f94
+17763	18578	7945606331250272	C:/Users/AQUINO_PC/Puck Sense AI/Library/Bee/Android/Prj/IL2CPP/Gradle/unityLibrary/build/intermediates/cxx/RelWithDebInfo/1y1m2229/obj/arm64-v8a/libgame.so	7029b9da305fad3a

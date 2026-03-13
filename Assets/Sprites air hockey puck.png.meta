@@ -116,10 +116,10 @@ TextureImporter:
       name: Sprites air hockey puck_0
       rect:
         serializedVersion: 2
-        x: 2
-        y: 2
-        width: 114
-        height: 113
+        x: 0
+        y: 0
+        width: 107
+        height: 107
       alignment: 0
       pivot: {x: 0, y: 0}
       border: {x: 0, y: 0, z: 0, w: 0}
