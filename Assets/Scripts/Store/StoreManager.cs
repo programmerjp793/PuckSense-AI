@@ -1,10 +1,23 @@
 // Assets/Scripts/Store/StoreManager.cs
 // Native ETH only (Sepolia Testnet)
 //
-// FIXES:
-//   CS0101 / CS0229 (PurchaseResult duplicate): REMOVED PurchaseResult class from
-//     bottom of this file. It is now defined ONLY in SharedModels.cs.
-//   CS0579 (duplicate [Serializable]): caused by the duplicate PurchaseResult — fixed.
+// BACKEND WIRING:
+//   GET  /store/items               → store.js  → blockchainService.getStoreItems()
+//   GET  /store/owned               → store.js  → blockchainService.getPlayerItems()
+//   POST /purchase/create-intent    → payment.js → in-memory intent store
+//   GET  /purchase/status/:intentId → payment.js → intent status poll
+//   POST /purchase/prepare-store-tx → payment.js → blockchainService.prepareStorePurchaseTx()
+//
+// DATA MAPPING (blockchainService.getStoreItems response → BlockchainStoreItem):
+//   itemId          ← item.itemId  (string: "wallet_upgrade_1", etc.)
+//   numericId       ← item.numericId
+//   name            ← item.name
+//   priceETH        ← item.price   (float, already in ETH)
+//   priceETHFormatted ← formatted from item.price
+//   pricePHP        ← derived from priceETH × PHP_RATE (configurable)
+//   itemType        ← mapped from itemId prefix
+//
+// PurchaseResult is defined in SharedModels.cs — do NOT redefine here.
 
 using System;
 using System.Collections.Generic;
@@ -19,10 +32,15 @@ public class StoreManager : MonoBehaviour
 {
     public static StoreManager Instance { get; private set; }
 
+    // ── PHP conversion rate (update to match your real rate) ─────────────────
+    [Header("Fiat Conversion")]
+    [Tooltip("ETH → PHP exchange rate used for display only")]
+    [SerializeField] private float ethToPHPRate = 170000f;   // ~₱170,000 per ETH
+
+    // ── UI References ─────────────────────────────────────────────────────────
     [Header("Coins & ETH Display")]
     [SerializeField] private TMP_Text coinsText;
-    [SerializeField] private TMP_Text ttkBalanceText;   // rename label to "ETH Balance" in Inspector
-    [Tooltip("Shows 'Loading...' while fetching blockchain items")]
+    [SerializeField] private TMP_Text ttkBalanceText;   // label: "ETH Balance"
     [SerializeField] private GameObject loadingIndicator;
 
     [Header("Detail Panel")]
@@ -34,7 +52,6 @@ public class StoreManager : MonoBehaviour
     [SerializeField] private Button      detailPurchaseButton;
     [SerializeField] private TMP_Text    detailPriceText;
     [SerializeField] private Button      detailCloseButton;
-    [Tooltip("Shows 'Processing payment...' overlay during blockchain/PayMongo purchase")]
     [SerializeField] private GameObject  purchasingOverlay;
     [SerializeField] private TMP_Text    purchasingStatusText;
 
@@ -42,29 +59,30 @@ public class StoreManager : MonoBehaviour
     [SerializeField] private List<StoreItemButton> storeItemButtons = new();
 
     [Header("Blockchain Store Items (ETH / Fiat)")]
-    [Tooltip("Assign UI buttons for blockchain items (wallet upgrades, feature unlocks)")]
     [SerializeField] private List<BlockchainItemButton> blockchainItemButtons = new();
 
-    // PurchaseResult comes from SharedModels.cs — do not redefine it here
+    // ── Events ────────────────────────────────────────────────────────────────
     [HideInInspector] public UnityEvent<List<BlockchainStoreItem>> OnBlockchainItemsLoaded = new();
     [HideInInspector] public UnityEvent<string>                    OnPurchaseStarted       = new();
     [HideInInspector] public UnityEvent<PurchaseResult>            OnPurchaseCompleted     = new();
     [HideInInspector] public UnityEvent<string>                    OnPurchaseFailed        = new();
 
+    // ── Public state ──────────────────────────────────────────────────────────
     public List<BlockchainStoreItem> BlockchainCatalog  { get; private set; } = new();
     public List<string>              OwnedBlockchainIds { get; private set; } = new();
 
+    // ── Private state ─────────────────────────────────────────────────────────
     private int    _playerCoins;
-    private string _selectedLocalItemId;
     private BlockchainStoreItem _selectedBlockchainItem;
     private LocalStoreItem      _selectedLocalItem;
-
     private string _pendingPaymentIntentId;
     private string _pendingItemId;
     private bool   _polling;
     private bool   _isBlockchainMode;
 
-    // ─── Lifecycle ────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+    //  LIFECYCLE
+    // ─────────────────────────────────────────────────────────────────────────
 
     void Awake()
     {
@@ -87,18 +105,19 @@ public class StoreManager : MonoBehaviour
         SetupDetailPanel();
         HideAllOverlays();
 
-        if (ApiClient.Instance != null)
-            LoadBlockchainItems();
-
+        // Subscribe to wallet events
         if (WalletManager.Instance != null)
         {
             WalletManager.Instance.OnBalanceUpdated.AddListener(OnEthBalanceUpdated);
             WalletManager.Instance.OnCoinsUpdated.AddListener(OnCoinsUpdatedFromWallet);
             UpdateEthDisplay(WalletManager.Instance.EthBalance);
-
             _playerCoins = WalletManager.Instance.CoinsBalance;
             UpdateCoinsDisplay();
         }
+
+        // Fetch store catalog from backend
+        if (ApiClient.Instance != null)
+            _ = LoadBlockchainItemsAsync();
     }
 
     void OnDestroy()
@@ -111,26 +130,26 @@ public class StoreManager : MonoBehaviour
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  LOCAL STORE (Coins-based: Skins, Powerups)
+    //  LOCAL STORE  (Coins — skins / powerups)
     // ═══════════════════════════════════════════════════════════════════════════
 
-    void SetupLocalItemButtons()
+    private void SetupLocalItemButtons()
     {
         foreach (var itemButton in storeItemButtons)
         {
             if (itemButton.button == null || itemButton.itemData == null)
             {
-                Debug.LogWarning("[Store] StoreItemButton has missing button or itemData.");
+                Debug.LogWarning("[Store] StoreItemButton missing button or itemData.");
                 continue;
             }
             itemButton.button.onClick.RemoveAllListeners();
-            var capturedItem = itemButton.itemData;
-            itemButton.button.onClick.AddListener(() => ShowLocalItemDetails(capturedItem));
-            Debug.Log($"[Store] Local button connected: {itemButton.itemData.itemName}");
+            var captured = itemButton.itemData;
+            itemButton.button.onClick.AddListener(() => ShowLocalItemDetails(captured));
+            Debug.Log($"[Store] Local button wired: {itemButton.itemData.itemName}");
         }
     }
 
-    void ShowLocalItemDetails(LocalStoreItem item)
+    private void ShowLocalItemDetails(LocalStoreItem item)
     {
         _isBlockchainMode       = false;
         _selectedLocalItem      = item;
@@ -155,12 +174,12 @@ public class StoreManager : MonoBehaviour
             isPurchased: isPurchased,
             canAfford:   _playerCoins >= item.price,
             isFree:      item.price == 0,
-            priceLabel:  item.price == 0 ? "GET" : item.price + " COINS",
+            priceLabel:  item.price == 0 ? "GET" : $"{item.price} COINS",
             onBuyAction: PurchaseLocalItem
         );
     }
 
-    void PurchaseLocalItem()
+    private void PurchaseLocalItem()
     {
         if (_selectedLocalItem == null) return;
 
@@ -179,11 +198,10 @@ public class StoreManager : MonoBehaviour
         PlayerPrefs.Save();
 
         ApplyLocalItemEffect(_selectedLocalItem);
-
         Debug.Log($"[Store] Purchased local item: {_selectedLocalItem.itemName}");
 
-        if (detailPriceText != null)      detailPriceText.text             = "OWNED";
-        if (detailPurchaseButton != null) detailPurchaseButton.interactable = false;
+        if (detailPriceText != null)      detailPriceText.text              = "OWNED";
+        if (detailPurchaseButton != null) detailPurchaseButton.interactable  = false;
 
         OnPurchaseCompleted.Invoke(new PurchaseResult
         {
@@ -194,7 +212,7 @@ public class StoreManager : MonoBehaviour
         Invoke(nameof(CloseDetailPanel), 1.5f);
     }
 
-    void ApplyLocalItemEffect(LocalStoreItem item)
+    private void ApplyLocalItemEffect(LocalStoreItem item)
     {
         switch (item.itemType)
         {
@@ -204,14 +222,21 @@ public class StoreManager : MonoBehaviour
             case ItemType.Powerup:     PlayerPrefs.SetInt("Powerup_" + item.itemID, 1);           break;
         }
         PlayerPrefs.Save();
-        Debug.Log($"[Store] Applied effect for: {item.itemID}");
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  BLOCKCHAIN STORE (ETH / PayMongo fiat)
+    //  BLOCKCHAIN STORE  (ETH / PayMongo fiat)
     // ═══════════════════════════════════════════════════════════════════════════
 
-    public async void LoadBlockchainItems()
+    /// <summary>
+    /// Fetches catalog from GET /store/items then owned items from GET /store/owned.
+    /// blockchainService.getStoreItems() returns items with fields:
+    ///   itemId (string), numericId, name, price (float ETH), priceWei, isAvailable
+    /// We map these onto BlockchainStoreItem and derive pricePHP + priceETHFormatted.
+    /// </summary>
+    public async void LoadBlockchainItems() => await LoadBlockchainItemsAsync();
+
+    public async Task LoadBlockchainItemsAsync()
     {
         if (loadingIndicator != null) loadingIndicator.SetActive(true);
         try
@@ -221,20 +246,28 @@ public class StoreManager : MonoBehaviour
 
             if (resp?.success == true)
             {
-                BlockchainCatalog = resp.items ?? new List<BlockchainStoreItem>();
-                Debug.Log($"[Store] Loaded {BlockchainCatalog.Count} blockchain items (ETH pricing).");
+                // Map raw backend items → BlockchainStoreItem (fill derived fields)
+                var catalog = new List<BlockchainStoreItem>();
+                foreach (var raw in resp.items ?? new List<RawStoreItem>())
+                {
+                    catalog.Add(MapRawItem(raw));
+                }
+
+                BlockchainCatalog = catalog;
+                Debug.Log($"[Store] Loaded {BlockchainCatalog.Count} blockchain items.");
+
                 await RefreshOwnedBlockchainItemsAsync();
                 BindBlockchainItemButtons();
                 OnBlockchainItemsLoaded.Invoke(BlockchainCatalog);
             }
             else
             {
-                Debug.LogWarning("[Store] Failed to load blockchain items: " + resp?.message);
+                Debug.LogWarning("[Store] /store/items returned success=false: " + resp?.message);
             }
         }
         catch (Exception e)
         {
-            Debug.LogWarning($"[Store] Blockchain items load failed: {e.Message}");
+            Debug.LogWarning($"[Store] LoadBlockchainItems failed: {e.Message}");
         }
         finally
         {
@@ -242,7 +275,35 @@ public class StoreManager : MonoBehaviour
         }
     }
 
-    void BindBlockchainItemButtons()
+    /// <summary>
+    /// Maps a raw backend item (from blockchainService.getStoreItems) to
+    /// the Unity-side BlockchainStoreItem, filling in derived display fields.
+    /// </summary>
+    private BlockchainStoreItem MapRawItem(RawStoreItem raw)
+    {
+        float priceETH = raw.price;   // already in ETH from fromWei() in blockchainService
+        string formatted = priceETH.ToString("F4");
+
+        // Infer itemType from the string itemId
+        string itemType = "feature_unlock";
+        if (raw.itemId?.Contains("wallet_upgrade") == true) itemType = "wallet_upgrade";
+        else if (raw.itemId?.Contains("ai_replay")  == true) itemType = "feature_unlock";
+        else if (raw.itemId?.Contains("custom_skin") == true) itemType = "custom_skin";
+
+        return new BlockchainStoreItem
+        {
+            itemId           = raw.itemId ?? $"item_{raw.numericId}",
+            numericId        = raw.numericId,
+            name             = raw.name ?? "Unknown Item",
+            itemType         = itemType,
+            priceETH         = priceETH,
+            priceETHFormatted = formatted,
+            pricePHP         = priceETH * ethToPHPRate,
+            active           = raw.isAvailable,
+        };
+    }
+
+    private void BindBlockchainItemButtons()
     {
         foreach (var btn in blockchainItemButtons)
         {
@@ -252,10 +313,11 @@ public class StoreManager : MonoBehaviour
             btn.button.onClick.RemoveAllListeners();
             var captured = catalogItem;
             btn.button.onClick.AddListener(() => ShowBlockchainItemDetails(captured));
+            Debug.Log($"[Store] Blockchain button wired: {catalogItem.name}");
         }
     }
 
-    void ShowBlockchainItemDetails(BlockchainStoreItem item)
+    private void ShowBlockchainItemDetails(BlockchainStoreItem item)
     {
         _isBlockchainMode       = true;
         _selectedBlockchainItem = item;
@@ -277,14 +339,14 @@ public class StoreManager : MonoBehaviour
             detailItemType.text = item.itemType == "wallet_upgrade" ? "Wallet Upgrade" : "Feature Unlock";
         if (detailItemDescription != null)
             detailItemDescription.text =
-                $"Blockchain item\nPrice: {item.priceETHFormatted} ETH  |  PHP {item.pricePHP:F2}";
+                $"Blockchain item\nPrice: {item.priceETHFormatted} ETH  |  ₱{item.pricePHP:F2}";
 
         bool isPurchased = OwnedBlockchainIds.Contains(item.itemId);
         bool walletOk    = WalletManager.Instance != null && WalletManager.Instance.IsConnected;
 
         string priceLabel = isPurchased ? "OWNED"
-                          : !walletOk   ? "Connect Wallet"
-                          : $"{item.priceETHFormatted} ETH  |  Pay with GCash/Card";
+                          : !walletOk   ? "Connect Wallet First"
+                          : $"{item.priceETHFormatted} ETH  |  Pay GCash/Card";
 
         SetupPurchaseButton(
             isPurchased: isPurchased,
@@ -295,11 +357,16 @@ public class StoreManager : MonoBehaviour
         );
     }
 
+    // ── Fiat Purchase (PayMongo / GCash) ──────────────────────────────────────
+
+    /// <summary>
+    /// POST /purchase/create-intent  (payment.js)
+    /// Then opens checkout URL and polls GET /purchase/status/:intentId
+    /// </summary>
     public async void PurchaseBlockchainItemWithFiat(string itemId)
     {
-        if (!WalletManager.Instance.IsConnected)
+        if (WalletManager.Instance == null || !WalletManager.Instance.IsConnected)
         {
-            Debug.LogWarning("[Store] Wallet not connected.");
             FlashPriceError("Connect wallet first!");
             return;
         }
@@ -310,13 +377,14 @@ public class StoreManager : MonoBehaviour
             ShowPurchasingOverlay("Creating payment...");
 
             string body = JsonConvert.SerializeObject(new { itemId });
-            string json = await ApiClient.Instance.PostAsync("/payment/create-intent", body);
+            string json = await ApiClient.Instance.PostAsync("/purchase/create-intent", body);
             var    resp = JsonConvert.DeserializeObject<CreateIntentResponse>(json);
 
             if (resp?.success != true)
             {
                 HidePurchasingOverlay();
-                OnPurchaseFailed.Invoke(resp?.message ?? "Payment creation failed");
+                string err = resp?.message ?? "Payment creation failed";
+                OnPurchaseFailed.Invoke(err);
                 FlashPriceError("Payment failed. Try again.");
                 return;
             }
@@ -324,9 +392,19 @@ public class StoreManager : MonoBehaviour
             _pendingPaymentIntentId = resp.paymentIntentId;
             _pendingItemId          = itemId;
 
-            ShowPurchasingOverlay("Opening PayMongo checkout...");
-            Debug.Log($"[Store] Opening PayMongo: {resp.checkoutUrl}");
-            Application.OpenURL(resp.checkoutUrl);
+            // Open PayMongo checkout if URL provided
+            if (!string.IsNullOrEmpty(resp.checkoutUrl))
+            {
+                ShowPurchasingOverlay("Opening PayMongo checkout...");
+                Debug.Log($"[Store] PayMongo URL: {resp.checkoutUrl}");
+                Application.OpenURL(resp.checkoutUrl);
+            }
+            else
+            {
+                ShowPurchasingOverlay("Waiting for payment confirmation...");
+                Debug.LogWarning("[Store] No checkoutUrl returned — polling status immediately.");
+            }
+
             StartPaymentPolling(resp.paymentIntentId);
         }
         catch (Exception e)
@@ -340,18 +418,17 @@ public class StoreManager : MonoBehaviour
 
     public async void CheckPaymentStatus()
     {
-        if (string.IsNullOrEmpty(_pendingPaymentIntentId)) return;
-        await PollPaymentStatusAsync(_pendingPaymentIntentId);
+        if (!string.IsNullOrEmpty(_pendingPaymentIntentId))
+            await PollPaymentStatusAsync(_pendingPaymentIntentId);
     }
 
     private async void StartPaymentPolling(string intentId)
     {
         if (_polling) return;
         _polling = true;
-        ShowPurchasingOverlay("Waiting for payment confirmation...");
 
-        int maxAttempts = 40;
-        int attempt     = 0;
+        const int maxAttempts = 40;  // 40 × 3s = 2 min
+        int attempt = 0;
 
         while (_polling && attempt < maxAttempts)
         {
@@ -359,27 +436,26 @@ public class StoreManager : MonoBehaviour
             attempt++;
             ShowPurchasingOverlay($"Checking payment... ({attempt * 3}s)");
             bool done = await PollPaymentStatusAsync(intentId);
-            if (done) break;
+            if (done) return;
         }
 
-        if (_polling)
-        {
-            _polling = false;
-            HidePurchasingOverlay();
-            OnPurchaseFailed.Invoke("Payment confirmation timed out. Check your payment history.");
-        }
+        // Timed out
+        _polling = false;
+        HidePurchasingOverlay();
+        OnPurchaseFailed.Invoke("Payment confirmation timed out. Check your payment history.");
     }
 
+    /// <summary>GET /purchase/status/:intentId (payment.js)</summary>
     private async Task<bool> PollPaymentStatusAsync(string intentId)
     {
         try
         {
-            string json = await ApiClient.Instance.GetAsync($"/payment/status/{intentId}");
+            string json = await ApiClient.Instance.GetAsync($"/purchase/status/{intentId}");
             var    resp = JsonConvert.DeserializeObject<PaymentStatusResponse>(json);
 
-            Debug.Log($"[Store] Payment status: {resp?.status}");
+            Debug.Log($"[Store] Intent status: {resp?.status}");
 
-            if (resp?.status == "succeeded" || resp?.status == "confirmed")
+            if (resp?.status is "succeeded" or "confirmed")
             {
                 _polling = false;
                 HidePurchasingOverlay();
@@ -399,14 +475,14 @@ public class StoreManager : MonoBehaviour
                 _pendingItemId          = null;
 
                 OnPurchaseCompleted.Invoke(result);
-
                 WalletManager.Instance?.RefreshBalance();
                 WalletManager.Instance?.SaveSession();
 
+                // Refresh the open detail panel
                 if (_selectedBlockchainItem != null)
                     ShowBlockchainItemDetails(_selectedBlockchainItem);
 
-                Debug.Log($"[Store] Payment confirmed! TxHash: {result.txHash}");
+                Debug.Log($"[Store] Fiat purchase confirmed! Tx: {result.txHash}");
                 return true;
             }
 
@@ -422,22 +498,37 @@ public class StoreManager : MonoBehaviour
         {
             Debug.LogWarning($"[Store] Poll error: {e.Message}");
         }
-
         return false;
     }
 
+    // ── Owned items ───────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// GET /store/owned  (store.js)
+    /// Requires wallet address — sent via X-Wallet-Address header (ApiClient injects it).
+    /// Falls back to query param if wallet is connected.
+    /// </summary>
     private async Task RefreshOwnedBlockchainItemsAsync()
     {
         try
         {
-            string json = await ApiClient.Instance.GetAsync("/store/owned");
+            // Build endpoint — include walletAddress as query param as extra fallback
+            string endpoint = "/store/owned";
+            if (WalletManager.Instance != null && WalletManager.Instance.IsConnected)
+                endpoint += $"?walletAddress={Uri.EscapeDataString(WalletManager.Instance.WalletAddress)}";
+
+            string json = await ApiClient.Instance.GetAsync(endpoint);
             var    resp = JsonConvert.DeserializeObject<OwnedResponse>(json);
+
             if (resp?.success == true)
+            {
                 OwnedBlockchainIds = new List<string>(resp.ownedItems ?? Array.Empty<string>());
+                Debug.Log($"[Store] Owned items: {OwnedBlockchainIds.Count}");
+            }
         }
         catch (Exception e)
         {
-            Debug.LogWarning($"[Store] Owned items refresh failed: {e.Message}");
+            Debug.LogWarning($"[Store] RefreshOwnedItems failed: {e.Message}");
         }
     }
 
@@ -445,30 +536,29 @@ public class StoreManager : MonoBehaviour
     //  SHARED UI HELPERS
     // ═══════════════════════════════════════════════════════════════════════════
 
-    void SetupDetailPanel()
+    private void SetupDetailPanel()
     {
         if (itemDetailPanel != null)   itemDetailPanel.SetActive(false);
         if (detailCloseButton != null) detailCloseButton.onClick.AddListener(CloseDetailPanel);
     }
 
-    void SetupPurchaseButton(bool isPurchased, bool canAfford, bool isFree,
-                             string priceLabel, Action onBuyAction)
+    private void SetupPurchaseButton(bool isPurchased, bool canAfford, bool isFree,
+                                     string priceLabel, Action onBuyAction)
     {
         if (detailPurchaseButton == null || detailPriceText == null) return;
 
         detailPurchaseButton.onClick.RemoveAllListeners();
         detailPriceText.text = priceLabel;
-
         var colors = detailPurchaseButton.colors;
 
         if (isPurchased)
         {
-            detailPurchaseButton.interactable = false;
+            detailPurchaseButton.interactable  = false;
             colors.normalColor = colors.disabledColor = new Color(0.5f, 0.5f, 0.5f);
         }
         else if (isFree || canAfford)
         {
-            detailPurchaseButton.interactable = true;
+            detailPurchaseButton.interactable  = true;
             colors.normalColor      = new Color(0.2f, 0.6f, 0.9f);
             colors.highlightedColor = new Color(0.3f, 0.7f, 1.0f);
             colors.pressedColor     = new Color(0.1f, 0.4f, 0.7f);
@@ -476,14 +566,14 @@ public class StoreManager : MonoBehaviour
         }
         else
         {
-            detailPurchaseButton.interactable = false;
+            detailPurchaseButton.interactable  = false;
             colors.normalColor = colors.disabledColor = new Color(0.6f, 0.3f, 0.3f);
         }
 
         detailPurchaseButton.colors = colors;
     }
 
-    void CloseDetailPanel()
+    private void CloseDetailPanel()
     {
         if (itemDetailPanel != null) itemDetailPanel.SetActive(false);
         _selectedLocalItem      = null;
@@ -491,7 +581,7 @@ public class StoreManager : MonoBehaviour
         HidePurchasingOverlay();
     }
 
-    void FlashPriceError(string message)
+    private void FlashPriceError(string message)
     {
         if (detailPriceText == null) return;
         detailPriceText.text  = message;
@@ -500,63 +590,61 @@ public class StoreManager : MonoBehaviour
         Invoke(nameof(ResetPriceText), 2f);
     }
 
-    void ResetPriceText()
+    private void ResetPriceText()
     {
         if (detailPriceText == null) return;
         detailPriceText.color = Color.white;
 
         if (_isBlockchainMode && _selectedBlockchainItem != null)
-            detailPriceText.text = $"{_selectedBlockchainItem.priceETHFormatted} ETH  |  Pay with GCash/Card";
+            detailPriceText.text = $"{_selectedBlockchainItem.priceETHFormatted} ETH  |  ₱{_selectedBlockchainItem.pricePHP:F2}";
         else if (!_isBlockchainMode && _selectedLocalItem != null)
-            detailPriceText.text = _selectedLocalItem.price == 0
-                ? "GET" : _selectedLocalItem.price + " COINS";
+            detailPriceText.text = _selectedLocalItem.price == 0 ? "GET" : $"{_selectedLocalItem.price} COINS";
     }
 
-    void ShowPurchasingOverlay(string message)
+    private void ShowPurchasingOverlay(string message)
     {
         if (purchasingOverlay != null)    purchasingOverlay.SetActive(true);
         if (purchasingStatusText != null) purchasingStatusText.text = message;
     }
 
-    void HidePurchasingOverlay()
+    private void HidePurchasingOverlay()
     {
         if (purchasingOverlay != null) purchasingOverlay.SetActive(false);
     }
 
-    void HideAllOverlays()
+    private void HideAllOverlays()
     {
         HidePurchasingOverlay();
         if (loadingIndicator != null) loadingIndicator.SetActive(false);
     }
 
-    // ─── Coins ────────────────────────────────────────────────────────────────
+    // ── Coins ─────────────────────────────────────────────────────────────────
 
-    void UpdateCoinsDisplay()
+    private void UpdateCoinsDisplay()
     {
         if (coinsText != null) coinsText.text = _playerCoins.ToString();
     }
 
-    void UpdateEthDisplay(string balance)
+    private void UpdateEthDisplay(string balance)
     {
         if (ttkBalanceText != null) ttkBalanceText.text = balance + " ETH";
     }
 
-    void OnEthBalanceUpdated(string balance) => UpdateEthDisplay(balance);
+    private void OnEthBalanceUpdated(string balance)  => UpdateEthDisplay(balance);
 
-    void OnCoinsUpdatedFromWallet(int coins)
+    private void OnCoinsUpdatedFromWallet(int coins)
     {
         _playerCoins = coins;
         UpdateCoinsDisplay();
-        Debug.Log($"[Store] Coins synced from WalletManager: {coins}");
     }
 
-    void SavePlayerCoins()
+    private void SavePlayerCoins()
     {
         PlayerPrefs.SetInt("PlayerCoins", _playerCoins);
         PlayerPrefs.Save();
     }
 
-    void LoadPlayerCoins()
+    private void LoadPlayerCoins()
     {
         _playerCoins = PlayerPrefs.GetInt("PlayerCoins", 100);
     }
@@ -582,14 +670,13 @@ public class StoreManager : MonoBehaviour
         }
     }
 
-    // ─── Public helpers ───────────────────────────────────────────────────────
+    // ── Public helpers ────────────────────────────────────────────────────────
 
     public bool PlayerOwnsBlockchainItem(string itemId) => OwnedBlockchainIds.Contains(itemId);
-
-    public bool PlayerOwnsLocalItem(string itemId) =>
+    public bool PlayerOwnsLocalItem(string itemId)      =>
         PlayerPrefs.GetInt("Purchased_" + itemId, 0) == 1;
 
-    string GetLocalItemTypeDisplay(ItemType type) => type switch
+    private string GetLocalItemTypeDisplay(ItemType type) => type switch
     {
         ItemType.PaddleSkin => "Paddle Skin",
         ItemType.PuckSkin   => "Puck Skin",
@@ -599,37 +686,55 @@ public class StoreManager : MonoBehaviour
     };
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  DATA MODELS  (local to StoreManager only)
+    //  DATA MODELS — Unity-side
     // ═══════════════════════════════════════════════════════════════════════════
 
     [Serializable]
     public class BlockchainStoreItem
     {
-        public string itemId;            // string key e.g. "wallet_upgrade_1"
-        public int    numericId;         // SmartStore.sol item ID (1-4)
+        public string itemId;             // "wallet_upgrade_1" etc.
+        public int    numericId;          // SmartStore.sol item ID (1-4)
         public string name;
-        public string itemType;          // "wallet_upgrade" | "ai_replay" | "custom_skin"
-        public float  priceETH;          // native ETH price
-        public string priceETHFormatted; // e.g. "0.0010"
-        public float  pricePHP;          // fiat price in PHP
+        public string itemType;           // "wallet_upgrade" | "feature_unlock" | "custom_skin"
+        public float  priceETH;           // ETH price (float)
+        public string priceETHFormatted;  // e.g. "0.0010"
+        public float  pricePHP;           // derived display-only fiat price
         public int    tier;
         public bool   active;
     }
 
-    [Serializable] private class ItemsResponse
+    // ── Raw response DTOs (match blockchainService.getStoreItems JSON exactly) ──
+
+    [Serializable]
+    private class RawStoreItem
     {
-        public bool                      success;
-        public string                    message;
-        public List<BlockchainStoreItem> items;
+        public string itemId;       // string key
+        public int    numericId;
+        public string name;
+        public float  price;        // already in ETH (fromWei applied on server)
+        public string priceWei;
+        public bool   isAvailable;
     }
 
-    [Serializable] private class OwnedResponse
+    [Serializable]
+    private class ItemsResponse
+    {
+        public bool            success;
+        public string          message;
+        public int             count;
+        public List<RawStoreItem> items;
+    }
+
+    [Serializable]
+    private class OwnedResponse
     {
         public bool     success;
         public string[] ownedItems;
+        public int      count;
     }
 
-    [Serializable] private class CreateIntentResponse
+    [Serializable]
+    private class CreateIntentResponse
     {
         public bool   success;
         public string message;
@@ -637,21 +742,25 @@ public class StoreManager : MonoBehaviour
         public string clientKey;
         public int    amount;
         public string checkoutUrl;
+        public string status;
+        public int    itemId;
     }
 
-    [Serializable] private class PaymentStatusResponse
+    [Serializable]
+    private class PaymentStatusResponse
     {
         public bool   success;
         public string status;
         public string txHash;
         public string itemId;
         public string explorerUrl;
+        public string intentId;
     }
 
-    // ── NOTE: PurchaseResult is NOT here — it lives in SharedModels.cs ────────
+    // ── PurchaseResult lives in SharedModels.cs — not here ───────────────────
 }
 
-// ─── Supporting types (global, used by Inspector) ────────────────────────────
+// ─── Inspector-facing supporting types ───────────────────────────────────────
 
 [Serializable]
 public class StoreItemButton
@@ -686,5 +795,3 @@ public class BlockchainItemButton
     public string itemId;
     public Sprite icon;
 }
-
-// ── PurchaseResult intentionally omitted — defined in SharedModels.cs ─────────

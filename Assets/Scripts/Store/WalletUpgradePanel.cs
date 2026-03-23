@@ -1,12 +1,27 @@
 // Assets/Scripts/Store/WalletUpgradePanel.cs
 // Native ETH only (Sepolia Testnet)
 //
-// FIXES:
-//   CS0229 (PurchaseResult ambiguity): PurchaseResult is now defined ONLY in SharedModels.cs.
-//   CS1501 (Setup overload): passes 4 args to UpgradeItemCard.Setup().
+// BACKEND WIRING (via StoreManager + WalletManager):
+//   • Opens panel  → LoadUpgrades() waits for StoreManager.BlockchainCatalog
+//                    (populated by GET /store/items in StoreManager.LoadBlockchainItemsAsync)
+//   • Fiat buy     → StoreManager.PurchaseBlockchainItemWithFiat()
+//                    → POST /purchase/create-intent  then polls GET /purchase/status/:id
+//   • ETH  buy     → WalletManager.PurchaseStoreItem()
+//                    → POST /purchase/prepare-store-tx  then MetaMask deep-link
+//
+// PREFAB REQUIREMENTS:
+//   Assign in Inspector:
+//     ttkBalanceText    — TMP_Text  showing ETH balance
+//     closeButton       — Button    top-right close
+//     itemsContainer    — Transform (ScrollView content rect or plain RectTransform)
+//     upgradeItemCardPrefab — UpgradeItemCard prefab (Assets/Prefabs/UpgradeItemCard)
+//     paymentStatusPanel — GameObject (overlay)
+//     statusMessageText  — TMP_Text inside paymentStatusPanel
+//     txHashText         — TMP_Text inside paymentStatusPanel
+//     doneButton         — Button   inside paymentStatusPanel
+//     loadingOverlay     — GameObject (spinner)
 
 using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 using UnityEngine;
@@ -15,8 +30,10 @@ using TMPro;
 
 public class WalletUpgradePanel : MonoBehaviour
 {
+    // ── Inspector fields ──────────────────────────────────────────────────────
+
     [Header("Header")]
-    [SerializeField] private TMP_Text ttkBalanceText;   // rename label to "ETH Balance" in Inspector
+    [SerializeField] private TMP_Text ttkBalanceText;
     [SerializeField] private Button   closeButton;
 
     [Header("Items Container")]
@@ -28,201 +45,350 @@ public class WalletUpgradePanel : MonoBehaviour
     [SerializeField] private TMP_Text   statusMessageText;
     [SerializeField] private TMP_Text   txHashText;
     [SerializeField] private Button     doneButton;
+    [Tooltip("Optional 'View on Explorer' button shown after a confirmed ETH tx")]
+    [SerializeField] private Button     explorerButton;
+    [SerializeField] private TMP_Text   explorerButtonText;
 
     [Header("Loading")]
     [SerializeField] private GameObject loadingOverlay;
 
-    private List<StoreManager.BlockchainStoreItem> _upgrades = new();
+    // ── State ─────────────────────────────────────────────────────────────────
+    private List<StoreManager.BlockchainStoreItem> _upgrades   = new();
+    private string _lastExplorerUrl;
 
     // ─────────────────────────────────────────────────────────────────────────
-    void OnEnable()
+    //  LIFECYCLE
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private void OnEnable()
     {
-        paymentStatusPanel.SetActive(false);
-        loadingOverlay.SetActive(false);
+        ResetStatusPanel();
+        SafeSetActive(loadingOverlay, false);
 
-        closeButton.onClick.AddListener(ClosePanel);
-        doneButton.onClick.AddListener(OnDoneClicked);
+        // Buttons
+        closeButton?.onClick.AddListener(ClosePanel);
+        doneButton?.onClick.AddListener(OnDoneClicked);
+        explorerButton?.onClick.AddListener(OnExplorerClicked);
+        SafeSetActive(explorerButton?.gameObject, false);
 
-        RefreshEthBalance();
-        LoadUpgrades();
-
-        StoreManager.Instance.OnPurchaseCompleted.AddListener(OnPurchaseCompleted);
-        StoreManager.Instance.OnPurchaseFailed.AddListener(OnPurchaseFailed);
-        StoreManager.Instance.OnPurchaseStarted.AddListener(OnPurchaseStarted);
-
+        // WalletManager events
         if (WalletManager.Instance != null)
         {
             WalletManager.Instance.OnBalanceUpdated.AddListener(OnEthBalanceUpdated);
-            WalletManager.Instance.OnTransactionSent += OnPurchaseTransactionSent;
+            WalletManager.Instance.OnTransactionSent += OnEthTransactionSent;
         }
-    }
 
-    void OnDisable()
-    {
-        closeButton.onClick.RemoveAllListeners();
-        doneButton.onClick.RemoveAllListeners();
-
+        // StoreManager events
         if (StoreManager.Instance != null)
         {
-            StoreManager.Instance.OnPurchaseCompleted.RemoveListener(OnPurchaseCompleted);
-            StoreManager.Instance.OnPurchaseFailed.RemoveListener(OnPurchaseFailed);
-            StoreManager.Instance.OnPurchaseStarted.RemoveListener(OnPurchaseStarted);
+            StoreManager.Instance.OnPurchaseStarted.AddListener(OnPurchaseStarted);
+            StoreManager.Instance.OnPurchaseCompleted.AddListener(OnPurchaseCompleted);
+            StoreManager.Instance.OnPurchaseFailed.AddListener(OnPurchaseFailed);
         }
+
+        RefreshEthBalance();
+        _ = LoadUpgradesAsync();
+    }
+
+    private void OnDisable()
+    {
+        closeButton?.onClick.RemoveAllListeners();
+        doneButton?.onClick.RemoveAllListeners();
+        explorerButton?.onClick.RemoveAllListeners();
 
         if (WalletManager.Instance != null)
         {
             WalletManager.Instance.OnBalanceUpdated.RemoveListener(OnEthBalanceUpdated);
-            WalletManager.Instance.OnTransactionSent -= OnPurchaseTransactionSent;
+            WalletManager.Instance.OnTransactionSent -= OnEthTransactionSent;
+        }
+
+        if (StoreManager.Instance != null)
+        {
+            StoreManager.Instance.OnPurchaseStarted.RemoveListener(OnPurchaseStarted);
+            StoreManager.Instance.OnPurchaseCompleted.RemoveListener(OnPurchaseCompleted);
+            StoreManager.Instance.OnPurchaseFailed.RemoveListener(OnPurchaseFailed);
         }
     }
 
-    // ── Balance ───────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+    //  BALANCE DISPLAY
+    // ─────────────────────────────────────────────────────────────────────────
 
-    void RefreshEthBalance()
+    private void RefreshEthBalance()
     {
-        ttkBalanceText.text = WalletManager.Instance != null
+        if (ttkBalanceText == null) return;
+        ttkBalanceText.text = WalletManager.Instance?.IsConnected == true
             ? $"Balance: {WalletManager.Instance.EthBalance} ETH"
             : "Balance: Connect Wallet";
     }
 
-    void OnEthBalanceUpdated(string balance)
+    private void OnEthBalanceUpdated(string balance)
     {
-        ttkBalanceText.text = $"Balance: {balance} ETH";
+        if (ttkBalanceText != null)
+            ttkBalanceText.text = $"Balance: {balance} ETH";
     }
 
-    // ── Load items ────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+    //  LOAD & SPAWN CARDS
+    // ─────────────────────────────────────────────────────────────────────────
 
-    async void LoadUpgrades()
+    /// <summary>
+    /// Waits for StoreManager to populate BlockchainCatalog (from GET /store/items),
+    /// then triggers a fresh fetch if still empty, then spawns cards.
+    /// </summary>
+    private async Task LoadUpgradesAsync()
     {
-        loadingOverlay.SetActive(true);
+        SafeSetActive(loadingOverlay, true);
         ClearCards();
 
-        if (StoreManager.Instance.BlockchainCatalog.Count == 0)
-            await Task.Delay(1000);
+        // Wait up to 3s for StoreManager to finish its own fetch
+        int waited = 0;
+        while (StoreManager.Instance.BlockchainCatalog.Count == 0 && waited < 6)
+        {
+            await Task.Delay(500);
+            waited++;
+        }
 
+        // If still empty, request a fresh fetch from the backend
+        if (StoreManager.Instance.BlockchainCatalog.Count == 0)
+        {
+            Debug.Log("[WalletUpgradePanel] Catalog empty — requesting fresh fetch from /store/items");
+            await StoreManager.Instance.LoadBlockchainItemsAsync();
+        }
+
+        // Filter to wallet upgrades and feature unlocks
         _upgrades = StoreManager.Instance.BlockchainCatalog
-            .FindAll(i => i.itemType == "wallet_upgrade" || i.itemType == "feature_unlock");
+            .FindAll(i => i.itemType == "wallet_upgrade" ||
+                          i.itemType == "feature_unlock"  ||
+                          i.itemType == "ai_replay"        ||
+                          i.itemType == "custom_skin");
+
+        if (_upgrades.Count == 0)
+            Debug.LogWarning("[WalletUpgradePanel] No upgrades found in catalog.");
 
         foreach (var item in _upgrades)
-            SpawnUpgradeCard(item);
+            SpawnCard(item);
 
-        loadingOverlay.SetActive(false);
+        SafeSetActive(loadingOverlay, false);
     }
 
-    void SpawnUpgradeCard(StoreManager.BlockchainStoreItem item)
+    private void SpawnCard(StoreManager.BlockchainStoreItem item)
     {
-        var card   = Instantiate(upgradeItemCardPrefab, itemsContainer);
-        var cardUI = card.GetComponent<UpgradeItemCard>();
-        if (cardUI == null) return;
+        if (upgradeItemCardPrefab == null)
+        {
+            Debug.LogError("[WalletUpgradePanel] upgradeItemCardPrefab is not assigned!");
+            return;
+        }
+
+        var go   = Instantiate(upgradeItemCardPrefab, itemsContainer);
+        var card = go.GetComponent<UpgradeItemCard>();
+        if (card == null)
+        {
+            Debug.LogError("[WalletUpgradePanel] UpgradeItemCard component missing from prefab!");
+            return;
+        }
 
         bool isOwned = StoreManager.Instance.PlayerOwnsBlockchainItem(item.itemId);
-
-        // FIX CS1501: UpgradeItemCard.Setup() now takes 4 params (item, isOwned, onFiat, onETH)
-        cardUI.Setup(item, isOwned, OnBuyWithFiatClicked, OnBuyWithETHClicked);
+        card.Setup(item, isOwned, OnBuyFiatClicked, OnBuyEthClicked);
     }
 
-    void ClearCards()
+    private void ClearCards()
     {
+        if (itemsContainer == null) return;
         foreach (Transform child in itemsContainer)
             Destroy(child.gameObject);
     }
 
-    // ── Purchase: Fiat (GCash/Card via PayMongo) ──────────────────────────────
-
-    void OnBuyWithFiatClicked(string itemId)
+    private void RefreshCards()
     {
+        ClearCards();
+        foreach (var item in _upgrades)
+            SpawnCard(item);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  PURCHASE HANDLERS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Fiat purchase: POST /purchase/create-intent → PayMongo checkout.
+    /// StoreManager handles the full flow and fires events below.
+    /// </summary>
+    private void OnBuyFiatClicked(string itemId)
+    {
+        Debug.Log($"[WalletUpgradePanel] Fiat buy: {itemId}");
         StoreManager.Instance.PurchaseBlockchainItemWithFiat(itemId);
     }
 
-    // ── Purchase: ETH (MetaMask Mobile deep link) ─────────────────────────────
-
-    async void OnBuyWithETHClicked(string itemId)
+    /// <summary>
+    /// ETH purchase: POST /purchase/prepare-store-tx → MetaMask deep link.
+    /// </summary>
+    private async void OnBuyEthClicked(string itemId)
     {
-        if (!WalletManager.Instance.IsConnected)
+        if (WalletManager.Instance == null || !WalletManager.Instance.IsConnected)
         {
-            ShowStatus("Connect your wallet first", "", false);
+            ShowStatus("Connect your wallet first.", null, false);
             return;
         }
 
-        var catalogItem = StoreManager.Instance.BlockchainCatalog.Find(i => i.itemId == itemId);
-        if (catalogItem == null) { ShowStatus("Item not found", "", false); return; }
+        var item = StoreManager.Instance.BlockchainCatalog.Find(i => i.itemId == itemId);
+        if (item == null)
+        {
+            ShowStatus("Item not found in catalog.", null, false);
+            return;
+        }
 
-        loadingOverlay.SetActive(true);
-        statusMessageText.text = $"Opening MetaMask for {catalogItem.name}...";
+        SafeSetActive(loadingOverlay, true);
+
+        if (statusMessageText != null)
+            statusMessageText.text = $"Opening MetaMask for {item.name}...";
 
         bool opened = await WalletManager.Instance.PurchaseStoreItem(
-            catalogItem.numericId,
-            onTxSent: (txHash) => ShowStatus(
-                $"{catalogItem.name} purchased!\n" +
-                $"{catalogItem.priceETHFormatted} ETH sent to treasury.",
-                txHash, true)
-        );
+            item.numericId,
+            onTxSent: txHash =>
+            {
+                ShowStatus(
+                    $"{item.name} purchased!\n{item.priceETHFormatted} ETH sent.",
+                    txHash, true);
+            });
 
-        loadingOverlay.SetActive(false);
-        if (!opened) ShowStatus("Could not open MetaMask Mobile.", "", false);
+        SafeSetActive(loadingOverlay, false);
+
+        if (!opened)
+            ShowStatus("Could not open MetaMask. Is it installed?", null, false);
     }
 
-    // ── StoreManager event handlers ───────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+    //  STORE MANAGER EVENT HANDLERS
+    // ─────────────────────────────────────────────────────────────────────────
 
-    // FIX CS0229: PurchaseResult now has a single definition in SharedModels.cs only.
-    void OnPurchaseStarted(string itemId)
+    private void OnPurchaseStarted(string itemId)
     {
-        paymentStatusPanel.SetActive(true);
-        statusMessageText.text  = "Opening PayMongo checkout...";
-        statusMessageText.color = Color.yellow;
-        txHashText.text         = "";
-        doneButton.gameObject.SetActive(false);
+        ResetStatusPanel();
+        SafeSetActive(paymentStatusPanel, true);
+        if (statusMessageText != null)
+        {
+            statusMessageText.text  = "Opening PayMongo checkout...";
+            statusMessageText.color = Color.yellow;
+        }
+        doneButton?.gameObject.SetActive(false);
     }
 
-    void OnPurchaseCompleted(PurchaseResult result)
+    private void OnPurchaseCompleted(PurchaseResult result)
     {
-        paymentStatusPanel.SetActive(true);
-        statusMessageText.text  = "Payment Successful!";
-        statusMessageText.color = Color.green;
-        txHashText.text = string.IsNullOrEmpty(result.txHash)
-            ? ""
-            : $"Tx: {result.txHash.Substring(0, 10)}...";
-        doneButton.gameObject.SetActive(true);
+        SafeSetActive(paymentStatusPanel, true);
 
+        if (statusMessageText != null)
+        {
+            statusMessageText.text  = "✓ Payment Successful!";
+            statusMessageText.color = Color.green;
+        }
+
+        if (txHashText != null)
+        {
+            bool hasTx = !string.IsNullOrEmpty(result.txHash);
+            txHashText.gameObject.SetActive(hasTx);
+            if (hasTx)
+                txHashText.text = $"Tx: {TruncateHash(result.txHash)}";
+        }
+
+        // Show explorer button if we have a URL
+        _lastExplorerUrl = result.explorerUrl;
+        SafeSetActive(explorerButton?.gameObject,
+            !string.IsNullOrEmpty(result.explorerUrl));
+
+        doneButton?.gameObject.SetActive(true);
+
+        // Update wallet + cards
         WalletManager.Instance?.RefreshBalance();
         RefreshEthBalance();
-        ClearCards();
-        foreach (var item in _upgrades) SpawnUpgradeCard(item);
+
+        if (!string.IsNullOrEmpty(result.itemId) &&
+            !StoreManager.Instance.OwnedBlockchainIds.Contains(result.itemId))
+            StoreManager.Instance.OwnedBlockchainIds.Add(result.itemId);
+
+        RefreshCards();
+
+        Debug.Log($"[WalletUpgradePanel] Purchase complete: {result.itemId}  tx:{result.txHash}");
     }
 
-    void OnPurchaseFailed(string error)
+    private void OnPurchaseFailed(string error)
     {
-        paymentStatusPanel.SetActive(true);
-        statusMessageText.text  = $"Payment Failed\n{error}";
-        statusMessageText.color = Color.red;
-        txHashText.text         = "";
-        doneButton.gameObject.SetActive(true);
+        SafeSetActive(paymentStatusPanel, true);
+
+        if (statusMessageText != null)
+        {
+            statusMessageText.text  = $"✗ Payment Failed\n{error}";
+            statusMessageText.color = Color.red;
+        }
+
+        if (txHashText != null) txHashText.gameObject.SetActive(false);
+
+        SafeSetActive(explorerButton?.gameObject, false);
+        doneButton?.gameObject.SetActive(true);
+
+        Debug.LogWarning($"[WalletUpgradePanel] Purchase failed: {error}");
     }
 
-    void OnPurchaseTransactionSent(string txHash)
+    private void OnEthTransactionSent(string txHash)
     {
         ShowStatus("Transaction confirmed!\nWallet upgrade applied.", txHash, true);
         WalletManager.Instance?.RefreshBalance();
-        ClearCards();
-        foreach (var item in _upgrades) SpawnUpgradeCard(item);
+        RefreshCards();
     }
 
-    // ── UI helpers ────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+    //  UI HELPERS
+    // ─────────────────────────────────────────────────────────────────────────
 
     private void ShowStatus(string message, string txHash, bool success)
     {
-        loadingOverlay.SetActive(false);
-        paymentStatusPanel.SetActive(true);
-        statusMessageText.text  = message;
-        statusMessageText.color = success ? Color.green : Color.red;
+        SafeSetActive(loadingOverlay, false);
+        SafeSetActive(paymentStatusPanel, true);
+
+        if (statusMessageText != null)
+        {
+            statusMessageText.text  = message;
+            statusMessageText.color = success ? Color.green : Color.red;
+        }
 
         bool hasTx = !string.IsNullOrEmpty(txHash);
-        txHashText.gameObject.SetActive(hasTx);
-        if (hasTx) txHashText.text = $"TX: {txHash.Substring(0, 10)}...";
+        if (txHashText != null)
+        {
+            txHashText.gameObject.SetActive(hasTx);
+            if (hasTx) txHashText.text = $"TX: {TruncateHash(txHash)}";
+        }
 
-        doneButton.gameObject.SetActive(true);
+        SafeSetActive(explorerButton?.gameObject, false);
+        doneButton?.gameObject.SetActive(true);
     }
 
-    void OnDoneClicked()  => paymentStatusPanel.SetActive(false);
-    void ClosePanel()     => gameObject.SetActive(false);
+    private void ResetStatusPanel()
+    {
+        SafeSetActive(paymentStatusPanel, false);
+        if (txHashText != null) txHashText.gameObject.SetActive(false);
+        SafeSetActive(explorerButton?.gameObject, false);
+        doneButton?.gameObject.SetActive(false);
+        _lastExplorerUrl = null;
+    }
+
+    private void OnDoneClicked()    => ResetStatusPanel();
+    private void ClosePanel()       => gameObject.SetActive(false);
+
+    private void OnExplorerClicked()
+    {
+        if (!string.IsNullOrEmpty(_lastExplorerUrl))
+            Application.OpenURL(_lastExplorerUrl);
+    }
+
+    private static string TruncateHash(string hash)
+    {
+        if (string.IsNullOrEmpty(hash)) return "";
+        return hash.Length > 12 ? $"{hash.Substring(0, 10)}..." : hash;
+    }
+
+    private static void SafeSetActive(GameObject go, bool active)
+    {
+        if (go != null) go.SetActive(active);
+    }
 }

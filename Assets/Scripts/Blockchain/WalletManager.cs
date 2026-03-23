@@ -1,13 +1,23 @@
 // Assets/Scripts/Blockchain/WalletManager.cs
 // Native ETH only (Sepolia Testnet)
 //
-// FIX (CS1061): ApiClient has no Post<T>/Get<T> generic methods.
-//   All calls now use PostAsync(string)/GetAsync(string) + Newtonsoft manual deserialize.
+// BACKEND WIRING (all paths relative to ApiClient.backendBaseUrl = ".../api"):
+//   GET  /wallet/balance?address=0x...   → wallet.js  → blockchainService.getPlayerInfo()
+//   POST /auth/link-wallet               → auth.js     → links wallet to player record
+//   POST /purchase/prepare-store-tx      → payment.js  → blockchainService.prepareStorePurchaseTx()
+//
+// FIXES:
+//   • Balance endpoint now passes address as query param AND as X-Wallet-Address header
+//     (ApiClient injects the header automatically).
+//   • RefreshBalanceAsync parses both `balance` (wei string) and `balanceFormatted` (ETH string)
+//     from wallet.js /balance response.  `tier` is read from /wallet/info instead.
+//   • PurchaseStoreItem posts to /purchase/prepare-store-tx (payment.js legacy alias).
 
 using System;
 using System.Threading.Tasks;
 using UnityEngine;
 using UnityEngine.Events;
+using Newtonsoft.Json;
 
 public class WalletManager : MonoBehaviour
 {
@@ -31,12 +41,11 @@ public class WalletManager : MonoBehaviour
     public event Action         OnWalletDisconnected;
     public UnityEvent<string>   OnBalanceUpdated = new();
     public UnityEvent<int>      OnCoinsUpdated   = new();
-
     public event Action<string> OnTransactionSent;
     public event Action<int>    OnTierUpdated;
     public event Action<string> OnError;
 
-    // ── Deep link ─────────────────────────────────────────────────────────────
+    // ── Internal ──────────────────────────────────────────────────────────────
     private const string DEEP_LINK_RETURN = "airhockey://wallet-callback";
     private Action<string> _pendingTxCallback;
 
@@ -76,6 +85,10 @@ public class WalletManager : MonoBehaviour
         Debug.Log("[Wallet] Switching MetaMask to Sepolia");
     }
 
+    /// <summary>
+    /// Called after MetaMask deep-link returns with an address,
+    /// or called directly from a UI input field.
+    /// </summary>
     public async void SetWalletAddress(string address)
     {
         if (string.IsNullOrEmpty(address) || !address.StartsWith("0x"))
@@ -96,6 +109,7 @@ public class WalletManager : MonoBehaviour
 
         await LinkWalletToPlayer();
         await RefreshBalanceAsync();
+        await RefreshTierAsync();        // fetch tier from /wallet/info
     }
 
     public void DisconnectWallet()
@@ -113,41 +127,52 @@ public class WalletManager : MonoBehaviour
 
     // ── Balance ───────────────────────────────────────────────────────────────
 
-    public async void RefreshBalance()
-    {
-        await RefreshBalanceAsync();
-    }
+    public async void RefreshBalance() => await RefreshBalanceAsync();
 
+    /// <summary>
+    /// Calls GET /wallet/balance?address=0x...
+    /// wallet.js returns { success, walletAddress, balance (wei string), note }
+    /// We convert wei → ETH here because the /balance endpoint on wallet.js
+    /// does NOT return balanceFormatted or tier (only /wallet/info does).
+    /// </summary>
     private async Task RefreshBalanceAsync()
     {
         if (!IsConnected) return;
         try
         {
+            // ApiClient will also inject X-Wallet-Address header automatically
             string json = await ApiClient.Instance.GetAsync(
-                $"/wallet/balance?address={WalletAddress}");
-            var resp = Newtonsoft.Json.JsonConvert.DeserializeObject<BalanceResponse>(json);
+                $"/wallet/balance?address={Uri.EscapeDataString(WalletAddress)}");
+
+            var resp = JsonConvert.DeserializeObject<BalanceResponse>(json);
 
             if (resp?.success == true)
             {
+                // wallet.js /balance returns raw wei in `balance`
                 string formatted = resp.balanceFormatted;
 
                 if (string.IsNullOrEmpty(formatted) && !string.IsNullOrEmpty(resp.balance))
                 {
-                    if (decimal.TryParse(resp.balance, out decimal wei))
+                    if (decimal.TryParse(resp.balance,
+                            System.Globalization.NumberStyles.Any,
+                            System.Globalization.CultureInfo.InvariantCulture,
+                            out decimal wei))
                         formatted = (wei / 1_000_000_000_000_000_000m).ToString("F4");
                     else
                         formatted = "0.0000";
                 }
 
                 EthBalance = formatted ?? "0.0000";
-                WalletTier = resp.tier;
 
                 PlayerPrefs.SetString($"EthBalance_{WalletAddress}", EthBalance);
                 PlayerPrefs.Save();
 
                 OnBalanceUpdated.Invoke(EthBalance);
-                OnTierUpdated?.Invoke(WalletTier);
-                Debug.Log($"[Wallet] ETH Balance: {EthBalance} | Tier: {WalletTier}");
+                Debug.Log($"[Wallet] ETH Balance: {EthBalance}");
+            }
+            else
+            {
+                Debug.LogWarning($"[Wallet] Balance fetch returned success=false");
             }
         }
         catch (Exception e)
@@ -156,34 +181,68 @@ public class WalletManager : MonoBehaviour
         }
     }
 
-    // ── Store Purchase ────────────────────────────────────────────────────────
+    /// <summary>
+    /// Calls GET /wallet/info to get the tier (wallet.js returns wallet.tier).
+    /// This is a separate call so balance and tier can update independently.
+    /// </summary>
+    private async Task RefreshTierAsync()
+    {
+        if (!IsConnected) return;
+        try
+        {
+            string json = await ApiClient.Instance.GetAsync("/wallet/info");
+            var resp = JsonConvert.DeserializeObject<WalletInfoResponse>(json);
 
-    // FIX CS1061: was ApiClient.Instance.Post<StorePurchaseTxData>() which does not exist.
-    // Now uses PostAsync (returns string) + manual Newtonsoft deserialize.
+            if (resp?.success == true && resp.wallet != null)
+            {
+                WalletTier = resp.wallet.tier;
+                OnTierUpdated?.Invoke(WalletTier);
+                Debug.Log($"[Wallet] Tier: {WalletTier}");
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning($"[Wallet] Tier refresh failed: {e.Message}");
+        }
+    }
+
+    // ── Store Purchase (ETH via MetaMask deep-link) ───────────────────────────
+
+    /// <summary>
+    /// Calls POST /purchase/prepare-store-tx
+    /// payment.js prepareStorePurchaseTx → blockchainService.prepareStorePurchaseTx()
+    /// Returns a MetaMask deep-link URL.
+    /// </summary>
     public async Task<bool> PurchaseStoreItem(int itemId, Action<string> onTxSent = null)
     {
         if (!IsConnected) { OnError?.Invoke("Wallet not connected"); return false; }
 
         try
         {
-            string body = Newtonsoft.Json.JsonConvert.SerializeObject(new { itemId });
-            string json = await ApiClient.Instance.PostAsync("/payment/prepare-store-tx", body);
-            var response = Newtonsoft.Json.JsonConvert.DeserializeObject<StorePurchaseTxData>(json);
+            var payload = new { itemId, walletAddress = WalletAddress };
+            string body = JsonConvert.SerializeObject(payload);
 
-            if (response == null || string.IsNullOrEmpty(response.deepLink))
+            // payment.js is mounted at /purchase (legacy alias endpoint)
+            string json = await ApiClient.Instance.PostAsync("/purchase/prepare-store-tx", body);
+            var response = JsonConvert.DeserializeObject<StorePurchaseTxData>(json);
+
+            if (response == null || !response.success || string.IsNullOrEmpty(response.deepLink))
             {
-                OnError?.Invoke("Failed to prepare transaction");
+                string msg = response?.message ?? "Failed to prepare transaction";
+                OnError?.Invoke(msg);
+                Debug.LogWarning($"[Wallet] prepare-store-tx failed: {msg}");
                 return false;
             }
 
             _pendingTxCallback = onTxSent;
-            Debug.Log($"[Wallet] Opening MetaMask for purchase: {response.deepLink}");
+            Debug.Log($"[Wallet] Opening MetaMask: {response.deepLink}");
             Application.OpenURL(response.deepLink);
             return true;
         }
         catch (Exception ex)
         {
             OnError?.Invoke($"Purchase failed: {ex.Message}");
+            Debug.LogError($"[Wallet] PurchaseStoreItem error: {ex.Message}");
             return false;
         }
     }
@@ -209,13 +268,13 @@ public class WalletManager : MonoBehaviour
     }
 
     void OnApplicationPause(bool paused) { if (paused) SaveSession(); }
-    void OnApplicationQuit() { SaveSession(); }
+    void OnApplicationQuit()             { SaveSession(); }
 
-    // ── Deep link handler ─────────────────────────────────────────────────────
+    // ── Deep Link Handler ─────────────────────────────────────────────────────
 
     private void OnDeepLinkActivated(string url)
     {
-        Debug.Log($"[Wallet] Deep link received: {url}");
+        Debug.Log($"[Wallet] Deep link: {url}");
         var query = ParseQuery(url);
 
         if (url.StartsWith("airhockey://wallet-callback"))
@@ -238,18 +297,20 @@ public class WalletManager : MonoBehaviour
 
     // ── Wallet Linking ────────────────────────────────────────────────────────
 
+    /// <summary>POST /auth/link-wallet — ties wallet address to player account.</summary>
     private async Task LinkWalletToPlayer()
     {
         try
         {
-            var body = Newtonsoft.Json.JsonConvert.SerializeObject(
-                new { walletAddress = WalletAddress, signature = "mobile-direct" });
+            var payload = new { walletAddress = WalletAddress, signature = "mobile-direct" };
+            string body = JsonConvert.SerializeObject(payload);
             await ApiClient.Instance.PostAsync("/auth/link-wallet", body);
             Debug.Log("[Wallet] Wallet linked to player.");
         }
         catch (Exception e)
         {
-            Debug.LogWarning($"[Wallet] Link failed: {e.Message}");
+            // Non-fatal — wallet may already be linked
+            Debug.LogWarning($"[Wallet] Link failed (may already be linked): {e.Message}");
         }
     }
 
@@ -276,24 +337,46 @@ public class WalletManager : MonoBehaviour
         return result;
     }
 
-    // ── Response Models (private, not shared) ─────────────────────────────────
+    // ── Response DTOs ─────────────────────────────────────────────────────────
+    // These match the JSON shapes returned by wallet.js
 
     [Serializable]
     private class BalanceResponse
     {
         public bool   success;
-        public string balance;
-        public string balanceFormatted;
+        public string balance;          // raw wei string from wallet.js /balance
+        public string balanceFormatted; // only present on /wallet/info wallet object
         public string symbol;
         public int    tier;
+        public string note;
+    }
+
+    [Serializable]
+    private class WalletInfoResponse
+    {
+        public bool         success;
+        public WalletData   wallet;
+
+        [Serializable]
+        public class WalletData
+        {
+            public string address;
+            public string balance;
+            public string balanceFormatted;
+            public string symbol;
+            public int    tier;
+        }
     }
 
     [Serializable]
     public class StorePurchaseTxData
     {
+        public bool   success;
         public string deepLink;
         public string itemName;
         public float  priceETH;
         public string message;
+        public int    itemId;
+        public string stringItemId;
     }
 }
