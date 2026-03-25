@@ -206,10 +206,97 @@ public class WalletManager : MonoBehaviour
         }
     }
 
-    // ── Store Purchase (ETH via MetaMask deep-link) ───────────────────────────
+    // ── Store Purchase via Web App (new flow) ──────────────────────────────────
 
     /// <summary>
-    /// Calls POST /purchase/prepare-store-tx
+    /// Called by StoreManager to initiate a web-app-based purchase.
+    /// Calls POST /purchase/prepare-web-tx → opens wallet web app URL in browser.
+    /// After user returns, polls /purchase/check-ownership to verify purchase.
+    /// </summary>
+    public async Task<bool> PurchaseViaWebApp(int itemId, Action<string> onTxSent = null)
+    {
+        if (!IsConnected) { OnError?.Invoke("Wallet not connected"); return false; }
+
+        try
+        {
+            var payload = new { itemId, walletAddress = WalletAddress };
+            string body = JsonConvert.SerializeObject(payload);
+
+            string json = await ApiClient.Instance.PostAsync("/purchase/prepare-web-tx", body);
+            var response = JsonConvert.DeserializeObject<WebAppPurchaseResponse>(json);
+
+            if (response == null || !response.success)
+            {
+                string msg = response?.message ?? "Failed to prepare web transaction";
+                OnError?.Invoke(msg);
+                Debug.LogWarning($"[Wallet] prepare-web-tx failed: {msg}");
+                return false;
+            }
+
+            _pendingTxCallback = onTxSent;
+
+            string url = response.webAppUrl;
+            
+            // Format for MetaMask in-app browser deep link
+            // e.g. https://metamask.app.link/dapp/pucksense-wallet.netlify.app/pay?...
+            string cleanUrl = url.Replace("https://", "").Replace("http://", "");
+            string metamaskUrl = $"https://metamask.app.link/dapp/{cleanUrl}";
+
+            // Open the wallet web app directly inside MetaMask Mobile
+            Debug.Log($"[Wallet] Opening MetaMask dApp browser: {metamaskUrl}");
+            Application.OpenURL(metamaskUrl);
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            OnError?.Invoke($"Purchase failed: {ex.Message}");
+            Debug.LogError($"[Wallet] PurchaseViaWebApp error: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Polls POST /purchase/check-ownership to verify the web app purchase completed.
+    /// Call this after Application.focusChanged or OnApplicationPause(false).
+    /// </summary>
+    public async Task<bool> PollOwnershipAsync(int itemId, int maxAttempts = 20, int delayMs = 3000)
+    {
+        if (!IsConnected) return false;
+
+        for (int i = 0; i < maxAttempts; i++)
+        {
+            try
+            {
+                var payload = new { walletAddress = WalletAddress, itemId };
+                string body = JsonConvert.SerializeObject(payload);
+                string json = await ApiClient.Instance.PostAsync("/purchase/check-ownership", body);
+
+                var resp = JsonConvert.DeserializeObject<OwnershipCheckResponse>(json);
+                if (resp?.success == true && resp.ownsItem)
+                {
+                    Debug.Log($"[Wallet] Ownership confirmed for item {itemId}");
+                    OnTransactionSent?.Invoke($"item_{itemId}_owned");
+                    _ = RefreshBalanceAsync();
+                    return true;
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[Wallet] Ownership poll error: {e.Message}");
+            }
+
+            await Task.Delay(delayMs);
+        }
+
+        Debug.LogWarning($"[Wallet] Ownership poll timed out for item {itemId}");
+        return false;
+    }
+
+    // ── Store Purchase (ETH via MetaMask deep-link — legacy) ─────────────────
+
+    /// <summary>
+    /// Legacy: Calls POST /purchase/prepare-store-tx
     /// payment.js prepareStorePurchaseTx → blockchainService.prepareStorePurchaseTx()
     /// Returns a MetaMask deep-link URL.
     /// </summary>
@@ -222,11 +309,10 @@ public class WalletManager : MonoBehaviour
             var payload = new { itemId, walletAddress = WalletAddress };
             string body = JsonConvert.SerializeObject(payload);
 
-            // payment.js is mounted at /purchase (legacy alias endpoint)
             string json = await ApiClient.Instance.PostAsync("/purchase/prepare-store-tx", body);
             var response = JsonConvert.DeserializeObject<StorePurchaseTxData>(json);
 
-            if (response == null || !response.success || string.IsNullOrEmpty(response.deepLink))
+            if (response == null || !response.success)
             {
                 string msg = response?.message ?? "Failed to prepare transaction";
                 OnError?.Invoke(msg);
@@ -235,8 +321,14 @@ public class WalletManager : MonoBehaviour
             }
 
             _pendingTxCallback = onTxSent;
-            Debug.Log($"[Wallet] Opening MetaMask: {response.deepLink}");
-            Application.OpenURL(response.deepLink);
+
+            // ── URI priority: deepLink (https universal link) → metamask:// scheme → eip681Uri
+            // Backend now returns all three. The EIP-681 scheme fixes:
+            //   1. Wrong network — @11155111 forces Sepolia
+            //   2. Plain transfer — function name + params encode the calldata correctly
+            string uriToOpen = PickBestUri(response);
+            Debug.Log($"[Wallet] Opening MetaMask via: {uriToOpen}");
+            Application.OpenURL(uriToOpen);
             return true;
         }
         catch (Exception ex)
@@ -245,6 +337,23 @@ public class WalletManager : MonoBehaviour
             Debug.LogError($"[Wallet] PurchaseStoreItem error: {ex.Message}");
             return false;
         }
+    }
+
+    /// <summary>
+    /// Picks the best URI to open MetaMask from the backend response.
+    /// Priority: deepLink (https universal link) → metamaskSchemeUri → eip681Uri → deepLink fallback
+    /// </summary>
+    private static string PickBestUri(StorePurchaseTxData r)
+    {
+#if UNITY_ANDROID
+        // On Android, the metamask:// custom scheme is most reliable for direct app open
+        if (!string.IsNullOrEmpty(r.metamaskSchemeUri)) return r.metamaskSchemeUri;
+#endif
+        // iOS + fallback: use the https universal link which the OS routes to MetaMask
+        if (!string.IsNullOrEmpty(r.deepLink))           return r.deepLink;
+        if (!string.IsNullOrEmpty(r.metamaskSchemeUri))  return r.metamaskSchemeUri;
+        if (!string.IsNullOrEmpty(r.eip681Uri))          return r.eip681Uri;
+        return r.deepLink ?? "";
     }
 
     // ── Coins ─────────────────────────────────────────────────────────────────
@@ -338,7 +447,7 @@ public class WalletManager : MonoBehaviour
     }
 
     // ── Response DTOs ─────────────────────────────────────────────────────────
-    // These match the JSON shapes returned by wallet.js
+    // These match the JSON shapes returned by payment.js
 
     [Serializable]
     private class BalanceResponse
@@ -372,11 +481,51 @@ public class WalletManager : MonoBehaviour
     public class StorePurchaseTxData
     {
         public bool   success;
+        public string message;
+
+        // Primary deep link — https universal link → MetaMask
         public string deepLink;
+
+        // Fallback URIs returned by the fixed blockchainService.js
+        public string eip681Uri;          // ethereum:<addr>@11155111/buyItem?uint256=<id>&value=<wei>
+        public string metamaskSchemeUri;  // metamask://wc?uri=<eip681>
+
+        // Debug / verification
+        public string calldataHex;
+        public string valueWei;
+        public string gasLimit;
+        public string storeAddress;
+        public int    chainId;
+        public int    itemId;
         public string itemName;
         public float  priceETH;
+    }
+
+    [Serializable]
+    public class WebAppPurchaseResponse
+    {
+        public bool   success;
         public string message;
+        public string webAppUrl;      // URL to open in browser
+        public string sessionId;      // tracking ID
+        public string storeAddress;
+        public string calldataHex;
+        public string valueWei;
+        public string gasLimit;
+        public int    chainId;
         public int    itemId;
         public string stringItemId;
+        public string itemName;
+        public float  priceETH;
+    }
+
+    [Serializable]
+    private class OwnershipCheckResponse
+    {
+        public bool   success;
+        public bool   ownsItem;
+        public int    itemId;
+        public string itemName;
+        public string playerAddress;
     }
 }

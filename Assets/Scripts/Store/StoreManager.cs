@@ -346,21 +346,123 @@ public class StoreManager : MonoBehaviour
 
         string priceLabel = isPurchased ? "OWNED"
                           : !walletOk   ? "Connect Wallet First"
-                          : $"{item.priceETHFormatted} ETH  |  Pay GCash/Card";
+                          : $"{item.priceETHFormatted} ETH  |  Buy with Wallet";
 
         SetupPurchaseButton(
             isPurchased: isPurchased,
             canAfford:   walletOk,
             isFree:      false,
             priceLabel:  priceLabel,
-            onBuyAction: () => PurchaseBlockchainItemWithFiat(item.itemId)
+            onBuyAction: () => PurchaseBlockchainItemViaWebApp(item.itemId, item.numericId)
         );
     }
 
-    // ── Fiat Purchase (PayMongo / GCash) ──────────────────────────────────────
+    // ── Web App Purchase Flow ─────────────────────────────────────────────────
 
     /// <summary>
-    /// POST /purchase/create-intent  (payment.js)
+    /// Initiates purchase via the React Native wallet web app.
+    /// Opens the web app in the device browser → user connects MetaMask → signs tx.
+    /// When user returns to the game, polls ownership to confirm purchase.
+    /// </summary>
+    public async void PurchaseBlockchainItemViaWebApp(string itemId, int numericId)
+    {
+        if (WalletManager.Instance == null || !WalletManager.Instance.IsConnected)
+        {
+            FlashPriceError("Connect wallet first!");
+            return;
+        }
+
+        try
+        {
+            OnPurchaseStarted.Invoke(itemId);
+            ShowPurchasingOverlay("Preparing transaction...");
+
+            bool opened = await WalletManager.Instance.PurchaseViaWebApp(numericId);
+
+            if (!opened)
+            {
+                HidePurchasingOverlay();
+                FlashPriceError("Failed to open wallet app.");
+                OnPurchaseFailed.Invoke("Failed to open wallet web app");
+                return;
+            }
+
+            ShowPurchasingOverlay("Complete purchase in browser...\nReturn here after confirming.");
+
+            // Store pending item info for when user returns
+            _pendingItemId = itemId;
+            _pendingWebPurchaseNumericId = numericId;
+            _awaitingWebPurchase = true;
+
+        }
+        catch (Exception e)
+        {
+            HidePurchasingOverlay();
+            Debug.LogError($"[Store] Web app purchase error: {e.Message}");
+            OnPurchaseFailed.Invoke(e.Message);
+            FlashPriceError("Error. Try again.");
+        }
+    }
+
+    // Tracking state for web app purchase polling
+    private int  _pendingWebPurchaseNumericId;
+    private bool _awaitingWebPurchase;
+
+    /// <summary>
+    /// Called when the app regains focus after web app purchase.
+    /// Polls ownership to check if the purchase completed.
+    /// </summary>
+    private async void OnApplicationFocus(bool hasFocus)
+    {
+        if (hasFocus && _awaitingWebPurchase && _pendingWebPurchaseNumericId > 0)
+        {
+            _awaitingWebPurchase = false;
+            ShowPurchasingOverlay("Verifying purchase...");
+
+            bool owned = await WalletManager.Instance.PollOwnershipAsync(
+                _pendingWebPurchaseNumericId, maxAttempts: 15, delayMs: 3000
+            );
+
+            if (owned)
+            {
+                HidePurchasingOverlay();
+                string stringItemId = _pendingItemId;
+
+                if (!string.IsNullOrEmpty(stringItemId) && !OwnedBlockchainIds.Contains(stringItemId))
+                    OwnedBlockchainIds.Add(stringItemId);
+
+                var result = new PurchaseResult
+                {
+                    itemId      = stringItemId,
+                    paymentType = "web_app_eth",
+                };
+
+                OnPurchaseCompleted.Invoke(result);
+                WalletManager.Instance?.RefreshBalance();
+                WalletManager.Instance?.SaveSession();
+
+                // Refresh the detail panel
+                if (_selectedBlockchainItem != null)
+                    ShowBlockchainItemDetails(_selectedBlockchainItem);
+
+                Debug.Log($"[Store] Web app purchase confirmed! Item: {stringItemId}");
+            }
+            else
+            {
+                HidePurchasingOverlay();
+                OnPurchaseFailed.Invoke("Purchase not confirmed. If you completed the transaction, please wait and try refreshing.");
+                FlashPriceError("Not confirmed yet. Try again.");
+            }
+
+            _pendingItemId = null;
+            _pendingWebPurchaseNumericId = 0;
+        }
+    }
+
+    // ── Fiat Purchase (PayMongo / GCash — legacy) ─────────────────────────────
+
+    /// <summary>
+    /// Legacy: POST /purchase/create-intent  (payment.js)
     /// Then opens checkout URL and polls GET /purchase/status/:intentId
     /// </summary>
     public async void PurchaseBlockchainItemWithFiat(string itemId)

@@ -221,9 +221,9 @@ public class WalletUpgradePanel : MonoBehaviour
     }
 
     /// <summary>
-    /// ETH purchase: POST /purchase/prepare-store-tx → MetaMask deep link.
+    /// ETH purchase: Redirects to the React Native web app via StoreManager
     /// </summary>
-    private async void OnBuyEthClicked(string itemId)
+    private void OnBuyEthClicked(string itemId)
     {
         if (WalletManager.Instance == null || !WalletManager.Instance.IsConnected)
         {
@@ -238,24 +238,8 @@ public class WalletUpgradePanel : MonoBehaviour
             return;
         }
 
-        SafeSetActive(loadingOverlay, true);
-
-        if (statusMessageText != null)
-            statusMessageText.text = $"Opening MetaMask for {item.name}...";
-
-        bool opened = await WalletManager.Instance.PurchaseStoreItem(
-            item.numericId,
-            onTxSent: txHash =>
-            {
-                ShowStatus(
-                    $"{item.name} purchased!\n{item.priceETHFormatted} ETH sent.",
-                    txHash, true);
-            });
-
-        SafeSetActive(loadingOverlay, false);
-
-        if (!opened)
-            ShowStatus("Could not open MetaMask. Is it installed?", null, false);
+        // Delegate to the StoreManager which handles the new Web App flow
+        StoreManager.Instance.PurchaseBlockchainItemViaWebApp(item.itemId, item.numericId);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
