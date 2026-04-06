@@ -28,6 +28,7 @@ public class MatchManager : MonoBehaviour
     public int       PlayerScore  { get; private set; }
     public int       AIScore      { get; private set; }
     public bool      MatchActive  { get; private set; }
+    private float    matchStartTime;
 
     void Awake()
     {
@@ -75,6 +76,7 @@ public class MatchManager : MonoBehaviour
             };
 
             MatchActive = true;
+            matchStartTime = Time.time;
 
             Debug.Log($"[Match] Match created: {CurrentMatch.matchId} | " +
                       $"Difficulty: {resp.aiProfile?.difficulty}");
@@ -114,16 +116,21 @@ public class MatchManager : MonoBehaviour
         {
             string profileJson = JsonConvert.SerializeObject(CurrentMatch.aiProfile);
             string profileHash = ComputeSHA256(profileJson);
+            
+            // Calculate match duration in seconds (enforce minimum 10s for backend validator)
+            int duration = Mathf.FloorToInt(Time.time - matchStartTime);
+            int durationSecs = Mathf.Max(10, duration);
 
             string body = JsonConvert.SerializeObject(new
             {
-                matchId       = CurrentMatch.matchId,
-                matchToken    = CurrentMatch.matchToken,
-                playerScore   = PlayerScore,
-                aiScore       = AIScore,
-                playerWon,
-                profileHash,
-                walletAddress = WalletManager.Instance?.WalletAddress ?? "",
+                matchId           = CurrentMatch.matchId,
+                matchToken        = CurrentMatch.matchToken,
+                playerScore       = PlayerScore,
+                aiScore           = AIScore,
+                winner            = playerWon ? "player" : "ai",
+                durationSecs      = durationSecs,
+                clientProfileHash = profileHash,
+                walletAddress     = WalletManager.Instance?.WalletAddress ?? "",
             });
 
             string json = await ApiClient.Instance.PostAsync("/match/submit-result", body);

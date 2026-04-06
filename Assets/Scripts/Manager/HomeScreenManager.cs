@@ -19,6 +19,7 @@ public class HomeScreenManager : MonoBehaviour
     [SerializeField] private GameObject storePanel;
     [SerializeField] private GameObject matchmakingPanel;
     [SerializeField] private GameObject howToPlayPanel;
+    [SerializeField] private GameObject highScorePanel;      // ← High Score panel (child of matchmaking)
 
     [Header("Wallet Upgrade")]
     [SerializeField] private GameObject walletUpgradePanel;
@@ -139,6 +140,7 @@ public class HomeScreenManager : MonoBehaviour
         if (storePanel != null)       storePanel.SetActive(false);
         if (matchmakingPanel != null) matchmakingPanel.SetActive(false);
         if (howToPlayPanel != null)   howToPlayPanel.SetActive(false);
+        if (highScorePanel != null)   highScorePanel.SetActive(false);
         // walletUpgradePanel has its own close button — not hidden here
     }
 

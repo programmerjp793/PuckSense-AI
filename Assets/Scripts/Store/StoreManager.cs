@@ -225,7 +225,7 @@ public class StoreManager : MonoBehaviour
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  BLOCKCHAIN STORE  (ETH / PayMongo fiat)
+    //  BLOCKCHAIN STORE  (ETH / Fiat)
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// <summary>
@@ -375,7 +375,7 @@ public class StoreManager : MonoBehaviour
         try
         {
             OnPurchaseStarted.Invoke(itemId);
-            ShowPurchasingOverlay("Preparing transaction...");
+            ShowPurchasingOverlay("Processing payment...");
 
             bool opened = await WalletManager.Instance.PurchaseViaWebApp(numericId);
 
@@ -390,10 +390,9 @@ public class StoreManager : MonoBehaviour
             ShowPurchasingOverlay("Complete purchase in browser...\nReturn here after confirming.");
 
             // Store pending item info for when user returns
-            _pendingItemId = itemId;
+            _pendingItemId               = itemId;
             _pendingWebPurchaseNumericId = numericId;
-            _awaitingWebPurchase = true;
-
+            _awaitingWebPurchase         = true;
         }
         catch (Exception e)
         {
@@ -454,15 +453,15 @@ public class StoreManager : MonoBehaviour
                 FlashPriceError("Not confirmed yet. Try again.");
             }
 
-            _pendingItemId = null;
+            _pendingItemId               = null;
             _pendingWebPurchaseNumericId = 0;
         }
     }
 
-    // ── Fiat Purchase (PayMongo / GCash — legacy) ─────────────────────────────
+    // ── Fiat Purchase (GCash / Card) ──────────────────────────────────────────
 
     /// <summary>
-    /// Legacy: POST /purchase/create-intent  (payment.js)
+    /// POST /purchase/create-intent  (payment.js)
     /// Then opens checkout URL and polls GET /purchase/status/:intentId
     /// </summary>
     public async void PurchaseBlockchainItemWithFiat(string itemId)
@@ -476,7 +475,7 @@ public class StoreManager : MonoBehaviour
         try
         {
             OnPurchaseStarted.Invoke(itemId);
-            ShowPurchasingOverlay("Creating payment...");
+            ShowPurchasingOverlay("Processing payment...");
 
             string body = JsonConvert.SerializeObject(new { itemId });
             string json = await ApiClient.Instance.PostAsync("/purchase/create-intent", body);
@@ -494,11 +493,10 @@ public class StoreManager : MonoBehaviour
             _pendingPaymentIntentId = resp.paymentIntentId;
             _pendingItemId          = itemId;
 
-            // Open PayMongo checkout if URL provided
             if (!string.IsNullOrEmpty(resp.checkoutUrl))
             {
-                ShowPurchasingOverlay("Opening PayMongo checkout...");
-                Debug.Log($"[Store] PayMongo URL: {resp.checkoutUrl}");
+                ShowPurchasingOverlay("Opening payment checkout...");
+                Debug.Log($"[Store] Checkout URL: {resp.checkoutUrl}");
                 Application.OpenURL(resp.checkoutUrl);
             }
             else
@@ -547,7 +545,6 @@ public class StoreManager : MonoBehaviour
         OnPurchaseFailed.Invoke("Payment confirmation timed out. Check your payment history.");
     }
 
-    /// <summary>GET /purchase/status/:intentId (payment.js)</summary>
     private async Task<bool> PollPaymentStatusAsync(string intentId)
     {
         try
@@ -555,7 +552,7 @@ public class StoreManager : MonoBehaviour
             string json = await ApiClient.Instance.GetAsync($"/purchase/status/{intentId}");
             var    resp = JsonConvert.DeserializeObject<PaymentStatusResponse>(json);
 
-            Debug.Log($"[Store] Intent status: {resp?.status}");
+            Debug.Log($"[Store] Payment status: {resp?.status}");
 
             if (resp?.status is "succeeded" or "confirmed")
             {
@@ -584,7 +581,7 @@ public class StoreManager : MonoBehaviour
                 if (_selectedBlockchainItem != null)
                     ShowBlockchainItemDetails(_selectedBlockchainItem);
 
-                Debug.Log($"[Store] Fiat purchase confirmed! Tx: {result.txHash}");
+                Debug.Log($"[Store] Payment confirmed! Tx: {result.txHash}");
                 return true;
             }
 
@@ -607,8 +604,8 @@ public class StoreManager : MonoBehaviour
 
     /// <summary>
     /// GET /store/owned  (store.js)
-    /// Requires wallet address — sent via X-Wallet-Address header (ApiClient injects it).
-    /// Falls back to query param if wallet is connected.
+    /// Returns the merged list of items owned across all wallets on this account.
+    /// Wallet address sent via query param; ApiClient also injects X-Wallet-Address header.
     /// </summary>
     private async Task RefreshOwnedBlockchainItemsAsync()
     {

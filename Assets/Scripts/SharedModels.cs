@@ -7,6 +7,8 @@
 //     MatchData, or PlayerProfile — DELETE those definitions from those files.
 //   • PurchaseResult is defined ONLY here. It has been REMOVED from the bottom
 //     of StoreManager.cs to fix CS0101 / CS0229 duplicate definition errors.
+//   • PlayerProfile and PlayerStats are defined ONLY here.
+//     DELETE the copies at the bottom of WalletAuthManager.cs.
 
 using System;
 using UnityEngine;
@@ -38,10 +40,22 @@ public class MatchData
 public class PlayerProfile
 {
     public string      id;
+    public string      unityPlayerId;
     public string      username;
+    public string      email;
     public string      walletAddress;
     public PlayerStats stats;
     public string[]    ownedItems;
+
+    // Balance fields — populated by every login response so the wallet UI
+    // can display the last-known balance instantly without waiting for an RPC call.
+    public string cachedEthBalance;     // e.g. "0.0123"
+    public string cachedEthBalanceWei;  // e.g. "12300000000000000"
+    public string ethBalanceFetchedAt;  // ISO date string
+
+    // High Score — personal best win time
+    public int    bestTime;             // fastest win duration in seconds (0 = no wins yet)
+    public string bestTimeMatchId;      // matchId where the best time was achieved
 
     public bool IsWalletConnected =>
         WalletManager.Instance != null && WalletManager.Instance.IsConnected;
@@ -70,5 +84,28 @@ public class PurchaseResult
     public string itemId;
     public string txHash;
     public string explorerUrl;
-    public string paymentType;  // "local_coins" | "fiat" | "eth"
+    public string paymentType;  // "local_coins" | "fiat" | "eth" | "web_app_eth"
+}
+
+// ─── High Score Models ────────────────────────────────────────────────────────
+
+[Serializable]
+public class HighScoreEntry
+{
+    public int    rank;
+    public string matchId;
+    public string difficulty;
+    public int    playerScore;
+    public int    opponentScore;
+    public int    durationSecs;
+    public string startedAt;
+}
+
+[Serializable]
+public class HighScoresResponse
+{
+    public bool             success;
+    public int              bestTime;          // personal best in seconds
+    public string           bestTimeMatchId;
+    public HighScoreEntry[] highscores;
 }

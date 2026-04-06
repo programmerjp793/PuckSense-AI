@@ -211,7 +211,7 @@ public class WalletUpgradePanel : MonoBehaviour
     // ─────────────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Fiat purchase: POST /purchase/create-intent → PayMongo checkout.
+    /// Fiat purchase: POST /purchase/create-intent → checkout.
     /// StoreManager handles the full flow and fires events below.
     /// </summary>
     private void OnBuyFiatClicked(string itemId)
@@ -221,7 +221,7 @@ public class WalletUpgradePanel : MonoBehaviour
     }
 
     /// <summary>
-    /// ETH purchase: Redirects to the React Native web app via StoreManager
+    /// ETH purchase: Redirects to the React Native web app via StoreManager.
     /// </summary>
     private void OnBuyEthClicked(string itemId)
     {
@@ -252,7 +252,7 @@ public class WalletUpgradePanel : MonoBehaviour
         SafeSetActive(paymentStatusPanel, true);
         if (statusMessageText != null)
         {
-            statusMessageText.text  = "Opening PayMongo checkout...";
+            statusMessageText.text  = "Processing payment...";
             statusMessageText.color = Color.yellow;
         }
         doneButton?.gameObject.SetActive(false);
@@ -264,7 +264,7 @@ public class WalletUpgradePanel : MonoBehaviour
 
         if (statusMessageText != null)
         {
-            statusMessageText.text  = "✓ Payment Successful!";
+            statusMessageText.text  = "✓ Purchase Successful!";
             statusMessageText.color = Color.green;
         }
 
@@ -302,7 +302,7 @@ public class WalletUpgradePanel : MonoBehaviour
 
         if (statusMessageText != null)
         {
-            statusMessageText.text  = $"✗ Payment Failed\n{error}";
+            statusMessageText.text  = $"✗ Purchase Failed\n{error}";
             statusMessageText.color = Color.red;
         }
 
@@ -316,7 +316,7 @@ public class WalletUpgradePanel : MonoBehaviour
 
     private void OnEthTransactionSent(string txHash)
     {
-        ShowStatus("Transaction confirmed!\nWallet upgrade applied.", txHash, true);
+        ShowStatus("Transaction confirmed!\nItem purchased successfully.", txHash, true);
         WalletManager.Instance?.RefreshBalance();
         RefreshCards();
     }

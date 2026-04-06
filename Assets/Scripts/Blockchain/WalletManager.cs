@@ -1,17 +1,14 @@
 // Assets/Scripts/Blockchain/WalletManager.cs
 // Native ETH only (Sepolia Testnet)
 //
-// BACKEND WIRING (all paths relative to ApiClient.backendBaseUrl = ".../api"):
-//   GET  /wallet/balance?address=0x...   → wallet.js  → blockchainService.getPlayerInfo()
-//   POST /auth/link-wallet               → auth.js     → links wallet to player record
-//   POST /purchase/prepare-store-tx      → payment.js  → blockchainService.prepareStorePurchaseTx()
-//
-// FIXES:
-//   • Balance endpoint now passes address as query param AND as X-Wallet-Address header
-//     (ApiClient injects the header automatically).
-//   • RefreshBalanceAsync parses both `balance` (wei string) and `balanceFormatted` (ETH string)
-//     from wallet.js /balance response.  `tier` is read from /wallet/info instead.
-//   • PurchaseStoreItem posts to /purchase/prepare-store-tx (payment.js legacy alias).
+// Balance sync changes (from WalletManager_BalancePatch.cs):
+//   1. Added EthBalanceWei property — raw wei string kept in sync with EthBalance.
+//   2. Added SetCachedBalance() — called by WalletAuthManager on login to populate
+//      the UI instantly from the server-cached value before any RPC call is made.
+//   3. RefreshBalanceAsync() now persists both formatted and wei values to
+//      PlayerPrefs after every successful live fetch, and also reads
+//      balanceFormatted + fromCache fields from the updated /wallet/balance response.
+//   4. Awake() restores both PREF_ETH_BALANCE and PREF_ETH_BALANCE_WEI on cold start.
 
 using System;
 using System.Threading.Tasks;
@@ -28,11 +25,19 @@ public class WalletManager : MonoBehaviour
     public const string SEPOLIA_CHAIN_ID_HEX = "0xaa36a7";
     public const string EXPLORER_BASE        = "https://sepolia.etherscan.io";
 
+    // ── PlayerPrefs keys ──────────────────────────────────────────────────────
+    // Centralised here so nothing else hard-codes key strings.
+    private const string PREF_WALLET_ADDRESS  = "WalletAddress";
+    private const string PREF_PLAYER_COINS    = "PlayerCoins";
+    private const string PREF_ETH_BALANCE     = "CachedEthBalance";     // NEW
+    private const string PREF_ETH_BALANCE_WEI = "CachedEthBalanceWei";  // NEW
+
     // ── State ─────────────────────────────────────────────────────────────────
-    public string WalletAddress { get; private set; }
-    public string EthBalance    { get; private set; } = "0";
-    public int    CoinsBalance  { get; private set; } = 100;
-    public int    WalletTier    { get; private set; } = 0;
+    public string WalletAddress   { get; private set; }
+    public string EthBalance      { get; private set; } = "0.0000";
+    public string EthBalanceWei   { get; private set; } = "0";           // NEW
+    public int    CoinsBalance    { get; private set; } = 100;
+    public int    WalletTier      { get; private set; } = 0;
 
     public bool IsConnected => !string.IsNullOrEmpty(WalletAddress);
 
@@ -58,9 +63,31 @@ public class WalletManager : MonoBehaviour
 
         Application.deepLinkActivated += OnDeepLinkActivated;
 
-        WalletAddress = PlayerPrefs.GetString("WalletAddress", "");
-        CoinsBalance  = PlayerPrefs.GetInt("PlayerCoins", 100);
-        EthBalance    = PlayerPrefs.GetString($"EthBalance_{WalletAddress}", "0");
+        // Restore wallet address
+        WalletAddress = PlayerPrefs.GetString(PREF_WALLET_ADDRESS, "");
+        CoinsBalance  = PlayerPrefs.GetInt(PREF_PLAYER_COINS, 100);
+
+        // NEW: restore both formatted balance and wei from dedicated prefs keys.
+        // This replaces the old per-address key ("EthBalance_0x...") with a
+        // single consistent key so SetCachedBalance() and RefreshBalanceAsync()
+        // always read/write the same location.
+        string savedBalance    = PlayerPrefs.GetString(PREF_ETH_BALANCE,     "0.0000");
+        string savedBalanceWei = PlayerPrefs.GetString(PREF_ETH_BALANCE_WEI, "0");
+
+        if (savedBalance != "0.0000")
+        {
+            EthBalance    = savedBalance;
+            EthBalanceWei = savedBalanceWei;
+            // Don't fire OnBalanceUpdated here — UI listeners aren't wired yet.
+            // WalletAuthManager.TryAutoLogin() calls SetCachedBalance() shortly
+            // after Awake(), which does fire the event at the right time.
+            Debug.Log($"[Wallet] Cold-start balance restored: {EthBalance} ETH");
+        }
+        else if (!string.IsNullOrEmpty(WalletAddress))
+        {
+            // Fallback: read the old per-address key written by the previous version
+            EthBalance = PlayerPrefs.GetString($"EthBalance_{WalletAddress}", "0.0000");
+        }
     }
 
     void OnDestroy()
@@ -99,27 +126,32 @@ public class WalletManager : MonoBehaviour
         }
 
         WalletAddress = address.Trim().ToLower();
-        PlayerPrefs.SetString("WalletAddress", WalletAddress);
+        PlayerPrefs.SetString(PREF_WALLET_ADDRESS, WalletAddress);
         PlayerPrefs.Save();
 
-        EthBalance = PlayerPrefs.GetString($"EthBalance_{WalletAddress}", "0");
+        // Restore any previously cached balance for this address while the
+        // live refresh is in flight so the UI is never empty.
+        string prev = PlayerPrefs.GetString(PREF_ETH_BALANCE, "0.0000");
+        if (prev != "0.0000")
+            SetCachedBalance(prev, PlayerPrefs.GetString(PREF_ETH_BALANCE_WEI, "0"));
 
         Debug.Log($"[Wallet] Wallet set: {WalletAddress}");
         OnWalletConnected?.Invoke(WalletAddress);
 
         await LinkWalletToPlayer();
         await RefreshBalanceAsync();
-        await RefreshTierAsync();        // fetch tier from /wallet/info
+        await RefreshTierAsync();
     }
 
     public void DisconnectWallet()
     {
         SaveSession();
         WalletAddress = "";
-        EthBalance    = "0";
+        EthBalance    = "0.0000";
+        EthBalanceWei = "0";
         CoinsBalance  = 100;
         WalletTier    = 0;
-        PlayerPrefs.DeleteKey("WalletAddress");
+        PlayerPrefs.DeleteKey(PREF_WALLET_ADDRESS);
         PlayerPrefs.Save();
         OnWalletDisconnected?.Invoke();
         Debug.Log("[Wallet] Wallet disconnected.");
@@ -127,20 +159,37 @@ public class WalletManager : MonoBehaviour
 
     // ── Balance ───────────────────────────────────────────────────────────────
 
+    // NEW: Applies a pre-fetched (server-cached) ETH balance and fires
+    // OnBalanceUpdated so the UI refreshes immediately without any network call.
+    // Called by WalletAuthManager right after a successful login response, and
+    // from Awake() when restoring a saved session.
+    public void SetCachedBalance(string formattedBalance, string balanceWei = "0")
+    {
+        EthBalance    = formattedBalance ?? "0.0000";
+        EthBalanceWei = balanceWei       ?? "0";
+
+        // Persist so TryAutoLogin can repopulate on next cold start
+        PlayerPrefs.SetString(PREF_ETH_BALANCE,     EthBalance);
+        PlayerPrefs.SetString(PREF_ETH_BALANCE_WEI, EthBalanceWei);
+        PlayerPrefs.Save();
+
+        OnBalanceUpdated?.Invoke(EthBalance);
+        Debug.Log($"[Wallet] Cached balance applied: {EthBalance} ETH");
+    }
+
     public async void RefreshBalance() => await RefreshBalanceAsync();
 
     /// <summary>
-    /// Calls GET /wallet/balance?address=0x...
-    /// wallet.js returns { success, walletAddress, balance (wei string), note }
-    /// We convert wei → ETH here because the /balance endpoint on wallet.js
-    /// does NOT return balanceFormatted or tier (only /wallet/info does).
+    /// GET /wallet/balance?address=0x...
+    /// Updated wallet.js now returns both `balance` (wei) and `balanceFormatted`
+    /// (4-decimal ETH string).  After a successful fetch both values are saved
+    /// to PlayerPrefs so they survive a process kill / cold start.
     /// </summary>
     private async Task RefreshBalanceAsync()
     {
         if (!IsConnected) return;
         try
         {
-            // ApiClient will also inject X-Wallet-Address header automatically
             string json = await ApiClient.Instance.GetAsync(
                 $"/wallet/balance?address={Uri.EscapeDataString(WalletAddress)}");
 
@@ -148,9 +197,11 @@ public class WalletManager : MonoBehaviour
 
             if (resp?.success == true)
             {
-                // wallet.js /balance returns raw wei in `balance`
+                // Prefer the formatted string returned by the updated wallet.js
                 string formatted = resp.balanceFormatted;
 
+                // Fallback: convert raw wei if balanceFormatted is absent
+                // (handles older server builds during a rolling deploy)
                 if (string.IsNullOrEmpty(formatted) && !string.IsNullOrEmpty(resp.balance))
                 {
                     if (decimal.TryParse(resp.balance,
@@ -162,28 +213,35 @@ public class WalletManager : MonoBehaviour
                         formatted = "0.0000";
                 }
 
-                EthBalance = formatted ?? "0.0000";
+                EthBalance    = formatted           ?? "0.0000";
+                EthBalanceWei = resp.balance        ?? "0";
 
+                // Persist both values — this is what survives a cold start
+                PlayerPrefs.SetString(PREF_ETH_BALANCE,     EthBalance);
+                PlayerPrefs.SetString(PREF_ETH_BALANCE_WEI, EthBalanceWei);
+                // Keep the legacy per-address key for WalletConnectUI compatibility
                 PlayerPrefs.SetString($"EthBalance_{WalletAddress}", EthBalance);
                 PlayerPrefs.Save();
 
                 OnBalanceUpdated.Invoke(EthBalance);
-                Debug.Log($"[Wallet] ETH Balance: {EthBalance}");
+                Debug.Log($"[Wallet] ETH Balance: {EthBalance} (fromCache={resp.fromCache})");
             }
             else
             {
-                Debug.LogWarning($"[Wallet] Balance fetch returned success=false");
+                Debug.LogWarning("[Wallet] Balance fetch returned success=false");
             }
         }
         catch (Exception e)
         {
             Debug.LogWarning($"[Wallet] Balance refresh failed: {e.Message}");
+            // Don't clear the displayed balance on a transient error —
+            // the cached value from PlayerPrefs is still showing.
         }
     }
 
     /// <summary>
-    /// Calls GET /wallet/info to get the tier (wallet.js returns wallet.tier).
-    /// This is a separate call so balance and tier can update independently.
+    /// GET /wallet/info — fetches tier (and re-syncs owned items as a side effect).
+    /// Separate from balance so both can update independently.
     /// </summary>
     private async Task RefreshTierAsync()
     {
@@ -206,13 +264,8 @@ public class WalletManager : MonoBehaviour
         }
     }
 
-    // ── Store Purchase via Web App (new flow) ──────────────────────────────────
+    // ── Store Purchase via Web App ─────────────────────────────────────────────
 
-    /// <summary>
-    /// Called by StoreManager to initiate a web-app-based purchase.
-    /// Calls POST /purchase/prepare-web-tx → opens wallet web app URL in browser.
-    /// After user returns, polls /purchase/check-ownership to verify purchase.
-    /// </summary>
     public async Task<bool> PurchaseViaWebApp(int itemId, Action<string> onTxSent = null)
     {
         if (!IsConnected) { OnError?.Invoke("Wallet not connected"); return false; }
@@ -235,17 +288,12 @@ public class WalletManager : MonoBehaviour
 
             _pendingTxCallback = onTxSent;
 
-            string url = response.webAppUrl;
-            
-            // Format for MetaMask in-app browser deep link
-            // e.g. https://metamask.app.link/dapp/pucksense-wallet.netlify.app/pay?...
+            string url      = response.webAppUrl;
             string cleanUrl = url.Replace("https://", "").Replace("http://", "");
             string metamaskUrl = $"https://metamask.app.link/dapp/{cleanUrl}";
 
-            // Open the wallet web app directly inside MetaMask Mobile
             Debug.Log($"[Wallet] Opening MetaMask dApp browser: {metamaskUrl}");
             Application.OpenURL(metamaskUrl);
-
             return true;
         }
         catch (Exception ex)
@@ -256,10 +304,6 @@ public class WalletManager : MonoBehaviour
         }
     }
 
-    /// <summary>
-    /// Polls POST /purchase/check-ownership to verify the web app purchase completed.
-    /// Call this after Application.focusChanged or OnApplicationPause(false).
-    /// </summary>
     public async Task<bool> PollOwnershipAsync(int itemId, int maxAttempts = 20, int delayMs = 3000)
     {
         if (!IsConnected) return false;
@@ -277,6 +321,7 @@ public class WalletManager : MonoBehaviour
                 {
                     Debug.Log($"[Wallet] Ownership confirmed for item {itemId}");
                     OnTransactionSent?.Invoke($"item_{itemId}_owned");
+                    // Refresh live balance now that the purchase ETH has been spent
                     _ = RefreshBalanceAsync();
                     return true;
                 }
@@ -295,11 +340,6 @@ public class WalletManager : MonoBehaviour
 
     // ── Store Purchase (ETH via MetaMask deep-link — legacy) ─────────────────
 
-    /// <summary>
-    /// Legacy: Calls POST /purchase/prepare-store-tx
-    /// payment.js prepareStorePurchaseTx → blockchainService.prepareStorePurchaseTx()
-    /// Returns a MetaMask deep-link URL.
-    /// </summary>
     public async Task<bool> PurchaseStoreItem(int itemId, Action<string> onTxSent = null)
     {
         if (!IsConnected) { OnError?.Invoke("Wallet not connected"); return false; }
@@ -322,10 +362,6 @@ public class WalletManager : MonoBehaviour
 
             _pendingTxCallback = onTxSent;
 
-            // ── URI priority: deepLink (https universal link) → metamask:// scheme → eip681Uri
-            // Backend now returns all three. The EIP-681 scheme fixes:
-            //   1. Wrong network — @11155111 forces Sepolia
-            //   2. Plain transfer — function name + params encode the calldata correctly
             string uriToOpen = PickBestUri(response);
             Debug.Log($"[Wallet] Opening MetaMask via: {uriToOpen}");
             Application.OpenURL(uriToOpen);
@@ -339,20 +375,14 @@ public class WalletManager : MonoBehaviour
         }
     }
 
-    /// <summary>
-    /// Picks the best URI to open MetaMask from the backend response.
-    /// Priority: deepLink (https universal link) → metamaskSchemeUri → eip681Uri → deepLink fallback
-    /// </summary>
     private static string PickBestUri(StorePurchaseTxData r)
     {
 #if UNITY_ANDROID
-        // On Android, the metamask:// custom scheme is most reliable for direct app open
         if (!string.IsNullOrEmpty(r.metamaskSchemeUri)) return r.metamaskSchemeUri;
 #endif
-        // iOS + fallback: use the https universal link which the OS routes to MetaMask
-        if (!string.IsNullOrEmpty(r.deepLink))           return r.deepLink;
-        if (!string.IsNullOrEmpty(r.metamaskSchemeUri))  return r.metamaskSchemeUri;
-        if (!string.IsNullOrEmpty(r.eip681Uri))          return r.eip681Uri;
+        if (!string.IsNullOrEmpty(r.deepLink))          return r.deepLink;
+        if (!string.IsNullOrEmpty(r.metamaskSchemeUri)) return r.metamaskSchemeUri;
+        if (!string.IsNullOrEmpty(r.eip681Uri))         return r.eip681Uri;
         return r.deepLink ?? "";
     }
 
@@ -360,7 +390,7 @@ public class WalletManager : MonoBehaviour
 
     public void SyncCoinsFromPrefs()
     {
-        CoinsBalance = PlayerPrefs.GetInt("PlayerCoins", 100);
+        CoinsBalance = PlayerPrefs.GetInt(PREF_PLAYER_COINS, 100);
         OnCoinsUpdated.Invoke(CoinsBalance);
         Debug.Log($"[Wallet] Coins synced: {CoinsBalance}");
     }
@@ -369,7 +399,10 @@ public class WalletManager : MonoBehaviour
 
     public void SaveSession()
     {
-        PlayerPrefs.SetInt("PlayerCoins", CoinsBalance);
+        PlayerPrefs.SetInt(PREF_PLAYER_COINS, CoinsBalance);
+        // Save balance under both the new canonical key and the legacy per-address key
+        PlayerPrefs.SetString(PREF_ETH_BALANCE,     EthBalance);
+        PlayerPrefs.SetString(PREF_ETH_BALANCE_WEI, EthBalanceWei);
         if (!string.IsNullOrEmpty(WalletAddress))
             PlayerPrefs.SetString($"EthBalance_{WalletAddress}", EthBalance);
         PlayerPrefs.Save();
@@ -406,7 +439,6 @@ public class WalletManager : MonoBehaviour
 
     // ── Wallet Linking ────────────────────────────────────────────────────────
 
-    /// <summary>POST /auth/link-wallet — ties wallet address to player account.</summary>
     private async Task LinkWalletToPlayer()
     {
         try
@@ -418,7 +450,6 @@ public class WalletManager : MonoBehaviour
         }
         catch (Exception e)
         {
-            // Non-fatal — wallet may already be linked
             Debug.LogWarning($"[Wallet] Link failed (may already be linked): {e.Message}");
         }
     }
@@ -447,24 +478,25 @@ public class WalletManager : MonoBehaviour
     }
 
     // ── Response DTOs ─────────────────────────────────────────────────────────
-    // These match the JSON shapes returned by payment.js
 
     [Serializable]
     private class BalanceResponse
     {
         public bool   success;
-        public string balance;          // raw wei string from wallet.js /balance
-        public string balanceFormatted; // only present on /wallet/info wallet object
+        public string balance;           // raw wei string
+        public string balanceFormatted;  // 4-decimal ETH string — new field from wallet.js
+        public bool   fromCache;         // true when live RPC was unavailable
         public string symbol;
         public int    tier;
         public string note;
+        public string warning;
     }
 
     [Serializable]
     private class WalletInfoResponse
     {
-        public bool         success;
-        public WalletData   wallet;
+        public bool       success;
+        public WalletData wallet;
 
         [Serializable]
         public class WalletData
@@ -474,6 +506,7 @@ public class WalletManager : MonoBehaviour
             public string balanceFormatted;
             public string symbol;
             public int    tier;
+            public bool   fromCache;
         }
     }
 
@@ -482,15 +515,9 @@ public class WalletManager : MonoBehaviour
     {
         public bool   success;
         public string message;
-
-        // Primary deep link — https universal link → MetaMask
         public string deepLink;
-
-        // Fallback URIs returned by the fixed blockchainService.js
-        public string eip681Uri;          // ethereum:<addr>@11155111/buyItem?uint256=<id>&value=<wei>
-        public string metamaskSchemeUri;  // metamask://wc?uri=<eip681>
-
-        // Debug / verification
+        public string eip681Uri;
+        public string metamaskSchemeUri;
         public string calldataHex;
         public string valueWei;
         public string gasLimit;
@@ -506,8 +533,8 @@ public class WalletManager : MonoBehaviour
     {
         public bool   success;
         public string message;
-        public string webAppUrl;      // URL to open in browser
-        public string sessionId;      // tracking ID
+        public string webAppUrl;
+        public string sessionId;
         public string storeAddress;
         public string calldataHex;
         public string valueWei;
